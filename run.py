@@ -249,14 +249,18 @@ def smooth_predictions(predictions, window_size=5):
 
 # Load data and split into train, validation, and test sets
 print("Loading data...")
-if os.path.exists("depth_data.npy") and os.path.exists("pose_data.npy"):
-    depth_data = np.load("depth_data.npy", allow_pickle=True)
-    pose_data = np.load("pose_data.npy", allow_pickle=True)
+data_dir = os.path.dirname(__file__)
+depth_data_path = os.path.join(data_dir, "depth_data.npy")
+pose_data_path = os.path.join(data_dir, "pose_data.npy")
+
+if os.path.exists(depth_data_path) and os.path.exists(pose_data_path):
+    depth_data = np.load(depth_data_path, allow_pickle=True)
+    pose_data = np.load(pose_data_path, allow_pickle=True)
 else:
-    sequence_path = "/home/jordanprescott/shiv_research/rgbd_dataset_freiburg1_room"
+    sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
     depth_data, pose_data = preprocess_tum_sequence(sequence_path, 3)
-    np.save("depth_data.npy", depth_data)
-    np.save("pose_data.npy", pose_data)
+    np.save(depth_data_path, depth_data)
+    np.save(pose_data_path, pose_data)
 
 train_depth, val_depth, train_pose, val_pose = train_test_split(depth_data, pose_data, test_size=0.2, random_state=42)
 val_depth, test_depth, val_pose, test_pose = train_test_split(val_depth, val_pose, test_size=0.5, random_state=42)
