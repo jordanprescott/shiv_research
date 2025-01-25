@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 from torchvision.models import resnet18
 
+# mess with number of epochs and learning rate
+# change weights when there is no change in translation/rotation
+# change to training on rotation
+# maybe just try it with MoGe
+
 class DepthPoseEstimationNN(nn.Module):
     def __init__(self):
         super(DepthPoseEstimationNN, self).__init__()
