@@ -282,9 +282,13 @@ def plot_pose_results(true_vals_seq, pred_vals_seq,
 
 
 # ---------------------------
-# Main Script
+# Main Script with CUDA Support
 # ---------------------------
 if __name__ == "__main__":
+    # Use GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     # Directory of this file
     data_dir = os.path.dirname(__file__)
     sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
@@ -325,7 +329,6 @@ if __name__ == "__main__":
     # ---------------------------
     # 2) Prepare NON-SEQUENTIAL data
     # ---------------------------
-    # We'll create a separate test set with random triplets spaced by min_gap
     depth_data_nonseq, pose_data_nonseq = preprocess_tum_sequence_nonsequential(
         sequence_path, 
         num_samples=100,   # How many random triplets you want
@@ -333,7 +336,6 @@ if __name__ == "__main__":
         target_size=(128, 128)
     )
 
-    # Just create a dataset & loader for these non-sequential frames
     if len(depth_data_nonseq) > 0:
         nonseq_dataset = DepthPoseDataset(depth_data_nonseq, pose_data_nonseq)
         nonseq_loader = DataLoader(nonseq_dataset, batch_size=16, shuffle=False)
@@ -343,14 +345,13 @@ if __name__ == "__main__":
     # ---------------------------
     # 3) Initialize & Train Model
     # ---------------------------
-    model = DepthPoseEstimationNN()
+    model = DepthPoseEstimationNN().to(device)  # Move model to GPU
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
 
-    # Optional: load a pretrained model if it exists
     if os.path.exists("depth_pose_model.pth"):
         print("Loading pretrained model...")
-        model.load_state_dict(torch.load("depth_pose_model.pth"))
+        model.load_state_dict(torch.load("depth_pose_model.pth", map_location=device))
     else:
         print("Training model on SEQUENTIAL data...")
         num_epochs = 30
@@ -358,6 +359,9 @@ if __name__ == "__main__":
             model.train()
             train_loss = 0.0
             for d1, d2, d3, pose in train_loader:
+                # Move data to GPU
+                d1, d2, d3, pose = d1.to(device), d2.to(device), d3.to(device), pose.to(device)
+
                 optimizer.zero_grad()
                 pred_pose = model(d1, d2, d3, pose)
                 loss = loss_fn(pred_pose, pose)
@@ -378,11 +382,14 @@ if __name__ == "__main__":
     model.eval()
     with torch.no_grad():
         for d1, d2, d3, pose in test_loader:
+            # Move data to GPU
+            d1, d2, d3, pose = d1.to(device), d2.to(device), d3.to(device), pose.to(device)
+
             pred_pose = model(d1, d2, d3, pose)
             loss = loss_fn(pred_pose, pose)
             test_loss += loss.item()
-            true_vals.append(pose.numpy())
-            pred_vals.append(pred_pose.numpy())
+            true_vals.append(pose.cpu().numpy())
+            pred_vals.append(pred_pose.cpu().numpy())
 
     true_vals = np.vstack(true_vals)
     pred_vals = np.vstack(pred_vals)
@@ -398,11 +405,14 @@ if __name__ == "__main__":
         model.eval()
         with torch.no_grad():
             for d1, d2, d3, pose in nonseq_loader:
+                # Move data to GPU
+                d1, d2, d3, pose = d1.to(device), d2.to(device), d3.to(device), pose.to(device)
+
                 pred_pose = model(d1, d2, d3, pose)
                 loss = loss_fn(pred_pose, pose)
                 nonseq_loss += loss.item()
-                nonseq_true_vals.append(pose.numpy())
-                nonseq_pred_vals.append(pred_pose.numpy())
+                nonseq_true_vals.append(pose.cpu().numpy())
+                nonseq_pred_vals.append(pred_pose.cpu().numpy())
 
         nonseq_true_vals = np.vstack(nonseq_true_vals)
         nonseq_pred_vals = np.vstack(nonseq_pred_vals)
@@ -410,18 +420,41 @@ if __name__ == "__main__":
     else:
         print("\nNo non-sequential data created (possibly not enough frames).")
 
-
-    # Suppose you have already computed these arrays:
-    # true_vals_seq, pred_vals_seq, true_vals_nonseq, pred_vals_nonseq
-    # Just call the function like this:
-
+    # Plot results
     plot_pose_results(true_vals, pred_vals, nonseq_true_vals, nonseq_pred_vals)
-    
-    # plot non-sequential data for rotation x component
+
+    # Plot specific component for non-sequential data
     plt.figure()
     plt.plot(nonseq_true_vals[:60, 3], label='True qx')
     plt.plot(nonseq_pred_vals[:60, 3], label='Predicted qx')
     plt.legend()
     plt.title("Rotation X Prediction")
     plt.show()
-    
+
+    # Number of components (translation: 3, rotation: 4)
+    num_components = true_vals.shape[1]  # Assuming true_vals and pred_vals are numpy arrays
+
+    # Create subplots
+    fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
+
+    # Titles for components
+    titles = ["Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
+            "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"]
+
+    for i in range(num_components):
+        axes[i].plot(true_vals[:, i], label='Ground Truth', marker='o', markersize=3, linestyle='-')
+        axes[i].plot(pred_vals[:, i], label='Predicted', marker='x', markersize=3, linestyle='--')
+        axes[i].set_ylabel(titles[i])
+        axes[i].legend()
+        axes[i].grid(True)
+
+    # Set shared x-label
+    axes[-1].set_xlabel("Sample Index")
+
+    # Add overall title
+    fig.suptitle("Ground Truth vs Predicted for All Components", fontsize=16)
+
+    # Adjust layout
+    plt.tight_layout(rect=[0, 0, 1, 0.97])  # Leave space for the suptitle
+
+    plt.show()

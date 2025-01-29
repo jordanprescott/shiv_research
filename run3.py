@@ -137,17 +137,22 @@ class DepthPoseDataset(Dataset):
         sequential_label = torch.tensor(sequential_label, dtype=torch.float32).unsqueeze(0)
         return d1, d2, d3, pose, sequential_label
 
+# Ensure CUDA is enabled if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 # Load and Split Data
 print("Loading data...")
 data_dir = os.path.dirname(__file__)
-depth_data_path = os.path.join(data_dir, "depth_data.npy")
-pose_data_path = os.path.join(data_dir, "pose_data.npy")
+save_folder = os.path.join(data_dir, "saved_data_3")
+os.makedirs(save_folder, exist_ok=True)
+depth_data_path = os.path.join(save_folder, "depth_data.npy")
+pose_data_path = os.path.join(save_folder, "pose_data.npy")
+
 sequential_labels_path = os.path.join(data_dir, "sequential_labels.npy")
 
 if os.path.exists(depth_data_path) and os.path.exists(pose_data_path) and os.path.exists(sequential_labels_path):
-    depth_data = np.load(depth_data_path, allow_pickle=True)
-    pose_data = np.load(pose_data_path, allow_pickle=True)
-    sequential_labels = np.load(sequential_labels_path, allow_pickle=True)
+    sequential_labels_path = os.path.join(save_folder, "sequential_labels_seq.npy")
 else:
     sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
     depth_data, pose_data, sequential_labels = preprocess_tum_sequence(sequence_path, frame_spacing=3)
@@ -171,20 +176,25 @@ val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
 # Training Loop
-model = DepthPoseEstimationNN()
+model = DepthPoseEstimationNN().to(device)  # Move model to GPU
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 pose_loss_fn = nn.MSELoss()
 seq_loss_fn = nn.BCELoss()  # Binary Cross-Entropy Loss for sequential prediction
 
 if os.path.exists("depth_pose_model.pth"):
     print("Loading pretrained model...")
-    model.load_state_dict(torch.load("depth_pose_model.pth"))
+    model.load_state_dict(torch.load("depth_pose_model.pth", map_location=device))
 else:
     print("Training model...")
-    for epoch in range(30):
+    for epoch in range(60):
         model.train()
         train_loss = 0.0
         for d1, d2, d3, pose, seq_label in train_loader:
+            # Move data to GPU
+            d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
+            pose = pose.to(device)
+            seq_label = seq_label.to(device)
+
             optimizer.zero_grad()
             pred_pose, pred_seq = model(d1, d2, d3)
             pose_loss = pose_loss_fn(pred_pose, pose)
@@ -194,7 +204,8 @@ else:
             optimizer.step()
             train_loss += loss.item()
         print(f"Epoch {epoch + 1}, Train Loss: {train_loss / len(train_loader)}")
-    torch.save(model.state_dict(), "depth_pose_model.pth")
+    torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
+
 
 # Evaluation
 test_loss = 0.0
@@ -203,26 +214,27 @@ true_seq, pred_seq = [], []
 model.eval()
 with torch.no_grad():
     for d1, d2, d3, pose, seq_label in test_loader:
+        # Move data to GPU
+        d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
+        pose = pose.to(device)
+        seq_label = seq_label.to(device)
+
         pred_pose, pred_seq_logits = model(d1, d2, d3)
         pose_loss = pose_loss_fn(pred_pose, pose)
         seq_loss = seq_loss_fn(pred_seq_logits, seq_label)
         loss = pose_loss + seq_loss
         test_loss += loss.item()
-        true_vals.append(pose.numpy())
-        pred_vals.append(pred_pose.numpy())
-        true_seq.append(seq_label.numpy())
-        pred_seq.append(pred_seq_logits.numpy())
+        true_vals.append(pose.cpu().numpy())  # Move data back to CPU for plotting
+        pred_vals.append(pred_pose.cpu().numpy())
+        true_seq.append(seq_label.cpu().numpy())
+        pred_seq.append(pred_seq_logits.cpu().numpy())
 
 true_vals = np.vstack(true_vals)
 pred_vals = np.vstack(pred_vals)
 true_seq = np.vstack(true_seq)
 pred_seq = np.vstack(pred_seq)
 
-
-
 print(f"Test Loss: {test_loss / len(test_loader)}")
-
-
 
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
