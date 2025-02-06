@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import torch.nn as nn
 
@@ -73,47 +74,50 @@ def quaternion_to_rotation_matrix(q):
 # ---------------------------
 # Preprocessing
 # ---------------------------
-def preprocess_tum_sequence(sequence_path, frame_spacing, target_size=(128, 128)):
+def preprocess_tum_sequence(parent_sequence_path, frame_spacing, target_size=(128, 128)):
     """
     Creates triplets of frames spaced by 'frame_spacing'.
     Example: i, i+frame_spacing, i+2*frame_spacing
     Useful for normal sequential data.
     """
-    depth_dir = os.path.join(sequence_path, "depth")
-    groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
+    for sequence_folder in os.listdir(parent_sequence_path):
+        sequence_path = os.path.join(parent_sequence_path, sequence_folder)
 
-    # Load ground-truth poses
-    groundtruth = pd.read_csv(
-        groundtruth_file, sep=" ", header=None, comment="#",
-        names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]
-    )
+        depth_dir = os.path.join(sequence_path, "depth")
+        groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
 
-    depth_files = sorted(os.listdir(depth_dir))
-    depth_files = [os.path.join(depth_dir, f) for f in depth_files if f.endswith(".png")]
+        # Load ground-truth poses
+        groundtruth = pd.read_csv(
+            groundtruth_file, sep=" ", header=None, comment="#",
+            names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]
+        )
 
-    depth_data = []
-    pose_data = []
+        depth_files = sorted(os.listdir(depth_dir))
+        depth_files = [os.path.join(depth_dir, f) for f in depth_files if f.endswith(".png")]
 
-    # We need up to i + 2*frame_spacing
-    max_idx = len(depth_files) - 2 * frame_spacing
-    for i in range(max_idx):
-        depth1 = cv2.imread(depth_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
-        depth2 = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-        depth3 = cv2.imread(depth_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+        depth_data = []
+        pose_data = []
 
-        # Resize and normalize
-        depth1 = cv2.resize(depth1, target_size) / 5000.0
-        depth2 = cv2.resize(depth2, target_size) / 5000.0
-        depth3 = cv2.resize(depth3, target_size) / 5000.0
+        # We need up to i + 2*frame_spacing
+        max_idx = len(depth_files) - 2 * frame_spacing
+        for i in range(max_idx):
+            depth1 = cv2.imread(depth_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            depth2 = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            depth3 = cv2.imread(depth_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
 
-        pose1 = groundtruth.iloc[i][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
-        pose3 = groundtruth.iloc[i + 2 * frame_spacing][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
+            # Resize and normalize
+            depth1 = cv2.resize(depth1, target_size) / 5000.0
+            depth2 = cv2.resize(depth2, target_size) / 5000.0
+            depth3 = cv2.resize(depth3, target_size) / 5000.0
 
-        # Relative pose from frame i to frame i + 2*frame_spacing
-        relative_pose = compute_relative_pose(pose1, pose3)
+            pose1 = groundtruth.iloc[i][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
+            pose3 = groundtruth.iloc[i + 2 * frame_spacing][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
 
-        depth_data.append((depth1, depth2, depth3))
-        pose_data.append(relative_pose)
+            # Relative pose from frame i to frame i + 2*frame_spacing
+            relative_pose = compute_relative_pose(pose1, pose3)
+
+            depth_data.append((depth1, depth2, depth3))
+            pose_data.append(relative_pose)
 
     return depth_data, pose_data
 
@@ -194,7 +198,10 @@ if __name__ == "__main__":
     data_dir = os.path.dirname(__file__)
     save_folder = os.path.join(data_dir, "saved_data_4")
     os.makedirs(save_folder, exist_ok=True)
-    sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
+    # sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
+    parent_sequence_path = os.path.join(data_dir, "tnt_data")
+
+
 
     # Numpy files for caching
     depth_data_path = os.path.join(save_folder, "depth_data_seq.npy")
@@ -210,7 +217,7 @@ if __name__ == "__main__":
     else:
         print("Preprocessing TUM sequence...")
         depth_data_seq, pose_data_seq = preprocess_tum_sequence(
-            sequence_path, frame_spacing=3
+            parent_sequence_path, frame_spacing=7
         )
         np.save(depth_data_path, depth_data_seq)
         np.save(pose_data_path, pose_data_seq)
@@ -286,30 +293,58 @@ if __name__ == "__main__":
     print(f"Test Loss: {test_loss / len(test_loader):.4f}")
 
 
+    import matplotlib.pyplot as plt
+
     # Number of components (translation: 3, rotation: 4)
     num_components = true_vals.shape[1]  # Assuming true_vals and pred_vals are numpy arrays
 
     # Create subplots
-    fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
+    fig = plt.figure(figsize=(12, 6))
+    ax1 = fig.add_subplot(111, projection='3d')
 
-    # Titles for components
-    titles = ["Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
-            "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"]
-
-    for i in range(num_components):
-        axes[i].plot(true_vals[:, i], label='Ground Truth', marker='o', markersize=3, linestyle='-')
-        axes[i].plot(pred_vals[:, i], label='Predicted', marker='x', markersize=3, linestyle='--')
-        axes[i].set_ylabel(titles[i])
-        axes[i].legend()
-        axes[i].grid(True)
-
-    # Set shared x-label
-    axes[-1].set_xlabel("Sample Index")
-
-    # Add overall title
-    fig.suptitle("Ground Truth vs Predicted for All Components", fontsize=16)
+    # Plot actual path vs predicted path in 3D
+    ax1.plot(true_vals[100:110, 0], true_vals[100:110, 1], true_vals[100:110, 2], label='Ground Truth', marker='o', markersize=3, linestyle='-')
+    ax1.plot(pred_vals[100:110, 0], pred_vals[100:110, 1], pred_vals[100:110, 2], label='Predicted', marker='x', markersize=3, linestyle='--')
+    ax1.set_xlabel("Translation X (tx)")
+    ax1.set_ylabel("Translation Y (ty)")
+    ax1.set_zlabel("Translation Z (tz)")
+    ax1.legend()
+    ax1.grid(True)
+    ax1.set_title("Actual Path vs Predicted Path (3D)")
 
     # Adjust layout
     plt.tight_layout(rect=[0, 0, 1, 0.97])  # Leave space for the suptitle
 
     plt.show()
+
+    # Convert to numpy arrays for analysis
+    true_vals = np.vstack(true_vals)
+    pred_vals = np.vstack(pred_vals)
+
+    # ---------------------------
+    # 4) Visualizations
+    # ---------------------------
+    # 4a) Pose Prediction Plot
+    def plot_pose_predictions(true_vals, pred_vals, sample_range=60):
+        titles = [
+            "Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
+            "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"
+        ]
+        num_components = true_vals.shape[1]
+        fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
+
+        for i in range(num_components):
+            axes[i].plot(true_vals[:sample_range, i], label='Ground Truth',
+                         marker='o', markersize=3, linestyle='-')
+            axes[i].plot(pred_vals[:sample_range, i], label='Predicted',
+                         marker='x', markersize=3, linestyle='--')
+            axes[i].set_ylabel(titles[i])
+            axes[i].legend()
+            axes[i].grid(True)
+
+        axes[-1].set_xlabel("Sample Index")
+        fig.suptitle("Ground Truth vs Predicted Pose Components", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
+
+    plot_pose_predictions(true_vals, pred_vals, sample_range=60)
