@@ -217,12 +217,14 @@ if __name__ == "__main__":
     else:
         print("Preprocessing TUM sequence...")
         depth_data_seq, pose_data_seq = preprocess_tum_sequence(
-            parent_sequence_path, frame_spacing=7
+            parent_sequence_path, frame_spacing=10
         )
         np.save(depth_data_path, depth_data_seq)
         np.save(pose_data_path, pose_data_seq)
 
-    # Split into train/val/test
+    # ---------------------------
+    # 2) Train-Val-Test Split
+    # ---------------------------
     train_depth, val_depth, train_pose, val_pose = train_test_split(
         depth_data_seq, pose_data_seq, test_size=0.2, random_state=42
     )
@@ -251,8 +253,10 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
     else:
         print("Training model...")
-        num_epochs = 200
+        best_val_loss = float('inf')
+        num_epochs = 50
         for epoch in range(num_epochs):
+            # Training phase
             model.train()
             train_loss = 0.0
             for d1, d2, d3, pose in train_loader:
@@ -265,10 +269,30 @@ if __name__ == "__main__":
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss / len(train_loader):.8f}")
 
-        # Save trained model
-        torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
+            train_loss /= len(train_loader)
+
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for d1, d2, d3, pose in val_loader:
+                    d1, d2, d3, pose = d1.to(device), d2.to(device), d3.to(device), pose.to(device)
+                    pred_pose = model(d1, d2, d3)
+                    loss = loss_fn(pred_pose, pose)
+                    val_loss += loss.item()
+
+            val_loss /= len(val_loader)
+
+            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.8f}, Val Loss: {val_loss:.8f}")
+
+            # Save the model only if the validation loss is the best we've seen so far
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
+                print(f"Saved best model at epoch {epoch + 1} with validation loss: {val_loss:.8f}")
+
+
 
     # ---------------------------
     # 4) Evaluate
@@ -295,28 +319,6 @@ if __name__ == "__main__":
 
     import matplotlib.pyplot as plt
 
-    # Number of components (translation: 3, rotation: 4)
-    num_components = true_vals.shape[1]  # Assuming true_vals and pred_vals are numpy arrays
-
-    # Create subplots
-    fig = plt.figure(figsize=(12, 6))
-    ax1 = fig.add_subplot(111, projection='3d')
-
-    # Plot actual path vs predicted path in 3D
-    ax1.plot(true_vals[100:110, 0], true_vals[100:110, 1], true_vals[100:110, 2], label='Ground Truth', marker='o', markersize=3, linestyle='-')
-    ax1.plot(pred_vals[100:110, 0], pred_vals[100:110, 1], pred_vals[100:110, 2], label='Predicted', marker='x', markersize=3, linestyle='--')
-    ax1.set_xlabel("Translation X (tx)")
-    ax1.set_ylabel("Translation Y (ty)")
-    ax1.set_zlabel("Translation Z (tz)")
-    ax1.legend()
-    ax1.grid(True)
-    ax1.set_title("Actual Path vs Predicted Path (3D)")
-
-    # Adjust layout
-    plt.tight_layout(rect=[0, 0, 1, 0.97])  # Leave space for the suptitle
-
-    plt.show()
-
     # Convert to numpy arrays for analysis
     true_vals = np.vstack(true_vals)
     pred_vals = np.vstack(pred_vals)
@@ -325,26 +327,64 @@ if __name__ == "__main__":
     # 4) Visualizations
     # ---------------------------
     # 4a) Pose Prediction Plot
-    def plot_pose_predictions(true_vals, pred_vals, sample_range=60):
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # Required for 3D plotting
+
+    def plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=None):
+        """
+        Plots 2D subplots for each pose component and a 3D path plot for the translation components.
+        
+        Parameters:
+        - true_vals: numpy array of ground truth pose values, shape (N, 7)
+        - pred_vals: numpy array of predicted pose values, shape (N, 7)
+        - sample_range: int, number of samples to plot for the 2D plots (default: 60)
+        - sample_range_3d: int, number of samples to plot for the 3D path plot.
+                        If None, it will use sample_range.
+        """
+        if sample_range_3d is None:
+            sample_range_3d = sample_range
+
+        # Titles for each pose component (first 3 are translations, last 4 are rotations)
         titles = [
             "Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
             "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"
         ]
         num_components = true_vals.shape[1]
+        
+        # Create subplots for each pose component (2D plots)
         fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
-
         for i in range(num_components):
             axes[i].plot(true_vals[:sample_range, i], label='Ground Truth',
-                         marker='o', markersize=3, linestyle='-')
+                        marker='o', markersize=3, linestyle='-')
             axes[i].plot(pred_vals[:sample_range, i], label='Predicted',
-                         marker='x', markersize=3, linestyle='--')
+                        marker='x', markersize=3, linestyle='--')
             axes[i].set_ylabel(titles[i])
             axes[i].legend()
             axes[i].grid(True)
-
         axes[-1].set_xlabel("Sample Index")
         fig.suptitle("Ground Truth vs Predicted Pose Components", fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.97])
+        
+        # Create a separate figure for the 3D path plot (using translation components)
+        fig_3d = plt.figure(figsize=(10, 8))
+        ax = fig_3d.add_subplot(111, projection='3d')
+        ax.plot(true_vals[:sample_range_3d, 0], 
+                true_vals[:sample_range_3d, 1], 
+                true_vals[:sample_range_3d, 2],
+                label='Ground Truth Path', marker='o', markersize=4, linestyle='-')
+        ax.plot(pred_vals[:sample_range_3d, 0], 
+                pred_vals[:sample_range_3d, 1], 
+                pred_vals[:sample_range_3d, 2],
+                label='Predicted Path', marker='x', markersize=4, linestyle='--')
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_title("3D Path: Ground Truth vs Predicted")
+        ax.legend()
+        
+        # Display both figures
         plt.show()
 
-    plot_pose_predictions(true_vals, pred_vals, sample_range=60)
+
+
+    plot_pose_predictions(true_vals, pred_vals, sample_range=5, sample_range_3d=5)

@@ -1,6 +1,6 @@
 run 3 introduces the indicator of scene overlap and changes the preprocessing to use random scenes
 
-run 4 introduces the use of triplets in training
+run 4 introduces the use of triplets in training. 4 now has validation loss as well as access to the larger datset, and is performing very well in the pose estimation. need to look into potentially not worrying about knowing about overlapping frames.
 
 run 5 combines triplets, overlap indicator, and skips in the processing of the xyz TUM dataset to indicate no overlap for training data
 
