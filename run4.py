@@ -244,7 +244,7 @@ if __name__ == "__main__":
     # 3) Initialize & Train Model
     # ---------------------------
     model = DepthPoseEstimationNN().to(device)  # Move model to GPU
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.25e-3)
     loss_fn = nn.MSELoss()
 
     pretrained_model_path = os.path.join(save_folder, "depth_pose_model.pth")
@@ -254,7 +254,7 @@ if __name__ == "__main__":
     else:
         print("Training model...")
         best_val_loss = float('inf')
-        num_epochs = 50
+        num_epochs = 200
         for epoch in range(num_epochs):
             # Training phase
             model.train()
@@ -291,6 +291,9 @@ if __name__ == "__main__":
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
                 print(f"Saved best model at epoch {epoch + 1} with validation loss: {val_loss:.8f}")
+            
+        # torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
+        
 
 
 
@@ -330,7 +333,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # Required for 3D plotting
 
-    def plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=None):
+    def plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=None, rotation_only=True):
         """
         Plots 2D subplots for each pose component and a 3D path plot for the translation components.
         
@@ -340,6 +343,10 @@ if __name__ == "__main__":
         - sample_range: int, number of samples to plot for the 2D plots (default: 60)
         - sample_range_3d: int, number of samples to plot for the 3D path plot.
                         If None, it will use sample_range.
+        - rotation_only: bool, if True, only the rotation components (last 4) are plotted in the subplots.
+        
+        Note:
+        The 3D plot always shows the translation path (first 3 components).
         """
         if sample_range_3d is None:
             sample_range_3d = sample_range
@@ -349,42 +356,57 @@ if __name__ == "__main__":
             "Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
             "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"
         ]
-        num_components = true_vals.shape[1]
         
-        # Create subplots for each pose component (2D plots)
-        fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
-        for i in range(num_components):
-            axes[i].plot(true_vals[:sample_range, i], label='Ground Truth',
-                        marker='o', markersize=3, linestyle='-')
-            axes[i].plot(pred_vals[:sample_range, i], label='Predicted',
-                        marker='x', markersize=3, linestyle='--')
-            axes[i].set_ylabel(titles[i])
-            axes[i].legend()
-            axes[i].grid(True)
+        # Decide which components to plot in the 2D subplots.
+        if rotation_only:
+            indices = list(range(3, 7))  # Only rotation components
+            suptitle_str = "Ground Truth vs Predicted Pose Rotations"
+        else:
+            indices = list(range(7))     # All components
+            suptitle_str = "Ground Truth vs Predicted Pose Components"
+        
+        num_plots = len(indices)
+        
+        # Create subplots for the selected pose components (2D plots)
+        fig, axes = plt.subplots(num_plots, 1, figsize=(10, 2 * num_plots), sharex=True)
+        
+        # If only one subplot, wrap it in a list for consistency
+        if num_plots == 1:
+            axes = [axes]
+        
+        for ax, i in zip(axes, indices):
+            ax.plot(true_vals[:sample_range, i], label='Ground Truth',
+                    marker='o', markersize=3, linestyle='-')
+            ax.plot(pred_vals[:sample_range, i], label='Predicted',
+                    marker='x', markersize=3, linestyle='--')
+            ax.set_ylabel(titles[i])
+            ax.legend()
+            ax.grid(True)
         axes[-1].set_xlabel("Sample Index")
-        fig.suptitle("Ground Truth vs Predicted Pose Components", fontsize=16)
+        fig.suptitle(suptitle_str, fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         
         # Create a separate figure for the 3D path plot (using translation components)
         fig_3d = plt.figure(figsize=(10, 8))
-        ax = fig_3d.add_subplot(111, projection='3d')
-        ax.plot(true_vals[:sample_range_3d, 0], 
+        ax3d = fig_3d.add_subplot(111, projection='3d')
+        ax3d.plot(true_vals[:sample_range_3d, 0], 
                 true_vals[:sample_range_3d, 1], 
                 true_vals[:sample_range_3d, 2],
                 label='Ground Truth Path', marker='o', markersize=4, linestyle='-')
-        ax.plot(pred_vals[:sample_range_3d, 0], 
+        ax3d.plot(pred_vals[:sample_range_3d, 0], 
                 pred_vals[:sample_range_3d, 1], 
                 pred_vals[:sample_range_3d, 2],
                 label='Predicted Path', marker='x', markersize=4, linestyle='--')
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_title("3D Path: Ground Truth vs Predicted")
-        ax.legend()
+        ax3d.set_xlabel("X")
+        ax3d.set_ylabel("Y")
+        ax3d.set_zlabel("Z")
+        ax3d.set_title("3D Path: Ground Truth vs Predicted")
+        ax3d.legend()
         
         # Display both figures
         plt.show()
 
+    
+    plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=5)
+    
 
-
-    plot_pose_predictions(true_vals, pred_vals, sample_range=5, sample_range_3d=5)
