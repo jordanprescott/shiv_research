@@ -75,7 +75,7 @@ def quaternion_to_rotation_matrix(q):
 # Preprocessing with Skips
 # ---------------------------
 def preprocess_tum_sequence(
-        sequence_path,
+        parent_sequence_path,
         frame_spacing,
         target_size=(128, 128),
         skip_probability=0.2,
@@ -91,67 +91,70 @@ def preprocess_tum_sequence(
         pose_data: list of [tx, ty, tz, qx, qy, qz, qw] (relative)
         sequential_labels: list of 1 (sequential) or 0 (non-sequential)
     """
-    depth_dir = os.path.join(sequence_path, "depth")
-    groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
+    for sequence_folder in os.listdir(parent_sequence_path):
+        sequence_path = os.path.join(parent_sequence_path, sequence_folder)
 
-    # Load ground-truth poses
-    groundtruth = pd.read_csv(
-        groundtruth_file, sep=" ", header=None, comment="#",
-        names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]
-    )
+        depth_dir = os.path.join(sequence_path, "da2")
+        groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
 
-    depth_files = sorted(os.listdir(depth_dir))
-    depth_files = [os.path.join(depth_dir, f) for f in depth_files if f.endswith(".png")]
+        # Load ground-truth poses
+        groundtruth = pd.read_csv(
+            groundtruth_file, sep=" ", header=None, comment="#",
+            names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]
+        )
 
-    depth_data = []
-    pose_data = []
-    sequential_labels = []
+        depth_files = sorted(os.listdir(depth_dir))
+        depth_files = [os.path.join(depth_dir, f) for f in depth_files if f.endswith(".png")]
 
-    # We need up to i + 2*frame_spacing
-    max_idx = len(depth_files) - 2 * frame_spacing
-    for i in range(max_idx):
-        depth1 = cv2.imread(depth_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
-        depth2 = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-        depth3 = cv2.imread(depth_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+        depth_data = []
+        pose_data = []
+        sequential_labels = []
 
-        # Guard against zero max, just in case
-        max1, max2, max3 = np.max(depth1), np.max(depth2), np.max(depth3)
-        # Avoid division by zero
-        max1 = max1 if max1 > 0 else 1.0
-        max2 = max2 if max2 > 0 else 1.0
-        max3 = max3 if max3 > 0 else 1.0
+        # We need up to i + 2*frame_spacing
+        max_idx = len(depth_files) - 2 * frame_spacing
+        for i in range(max_idx):
+            depth1 = cv2.imread(depth_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            depth2 = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            depth3 = cv2.imread(depth_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
 
-        depth1 = cv2.resize(depth1, target_size) / max1
-        depth2 = cv2.resize(depth2, target_size) / max2
-        depth3 = cv2.resize(depth3, target_size) / max3
+            # Guard against zero max, just in case
+            max1, max2, max3 = np.max(depth1), np.max(depth2), np.max(depth3)
+            # Avoid division by zero
+            max1 = max1 if max1 > 0 else 1.0
+            max2 = max2 if max2 > 0 else 1.0
+            max3 = max3 if max3 > 0 else 1.0
 
-        # Relative pose from frame i to frame i + 2*frame_spacing
-        pose1 = groundtruth.iloc[i][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
-        pose3 = groundtruth.iloc[i + 2 * frame_spacing][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
-        relative_pose = compute_relative_pose(pose1, pose3)
+            depth1 = cv2.resize(depth1, target_size) / max1
+            depth2 = cv2.resize(depth2, target_size) / max2
+            depth3 = cv2.resize(depth3, target_size) / max3
 
-        # This is the standard "sequential" sample
-        depth_data.append((depth1, depth2, depth3))
-        pose_data.append(relative_pose)
-        sequential_labels.append(1)  # 1 => sequential
+            # Relative pose from frame i to frame i + 2*frame_spacing
+            pose1 = groundtruth.iloc[i][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
+            pose3 = groundtruth.iloc[i + 2 * frame_spacing][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
+            relative_pose = compute_relative_pose(pose1, pose3)
 
-        # Possibly add a "non-sequential" sample
-        if np.random.rand() < skip_probability:
-            skip_frames = np.random.randint(min_skip_frames, max_skip_frames + 1)
-            # Make sure we don't exceed the dataset length
-            non_seq_index = i + 2 * frame_spacing + skip_frames
-            if non_seq_index < len(depth_files):
-                # third image is now further away
-                non_seq_depth3 = cv2.imread(depth_files[non_seq_index], cv2.IMREAD_UNCHANGED).astype(np.float32)
-                m3 = np.max(non_seq_depth3)
-                m3 = m3 if m3 > 0 else 1.0
-                non_seq_depth3 = cv2.resize(non_seq_depth3, target_size) / m3
+            # This is the standard "sequential" sample
+            depth_data.append((depth1, depth2, depth3))
+            pose_data.append(relative_pose)
+            sequential_labels.append(1)  # 1 => sequential
 
-                # We'll reuse the same relative_pose for demonstration, 
-                # but note that physically this might not match the frames.
-                depth_data.append((depth1, depth2, non_seq_depth3))
-                pose_data.append(relative_pose)
-                sequential_labels.append(0)  # 0 => non-sequential
+            # Possibly add a "non-sequential" sample
+            if np.random.rand() < skip_probability:
+                skip_frames = np.random.randint(min_skip_frames, max_skip_frames + 1)
+                # Make sure we don't exceed the dataset length
+                non_seq_index = i + 2 * frame_spacing + skip_frames
+                if non_seq_index < len(depth_files):
+                    # third image is now further away
+                    non_seq_depth3 = cv2.imread(depth_files[non_seq_index], cv2.IMREAD_UNCHANGED).astype(np.float32)
+                    m3 = np.max(non_seq_depth3)
+                    m3 = m3 if m3 > 0 else 1.0
+                    non_seq_depth3 = cv2.resize(non_seq_depth3, target_size) / m3
+
+                    # We'll reuse the same relative_pose for demonstration, 
+                    # but note that physically this might not match the frames.
+                    depth_data.append((depth1, depth2, non_seq_depth3))
+                    pose_data.append(relative_pose)
+                    sequential_labels.append(0)  # 0 => non-sequential
 
     return depth_data, pose_data, sequential_labels
 
@@ -250,7 +253,7 @@ if __name__ == "__main__":
     data_dir = os.path.dirname(__file__)
     save_folder = os.path.join(data_dir, "saved_data_5")
     os.makedirs(save_folder, exist_ok=True)
-    sequence_path = os.path.join(data_dir, "rgbd_dataset_freiburg1_room")
+    parent_sequence_path = os.path.join(data_dir, "tnt_data")
 
     # Numpy files for caching
     depth_data_path = os.path.join(save_folder, "depth_data_seq.npy")
@@ -272,11 +275,11 @@ if __name__ == "__main__":
     else:
         print("Preprocessing TUM sequence with skipping...")
         depth_data_seq, pose_data_seq, seq_labels_seq = preprocess_tum_sequence(
-            sequence_path,
-            frame_spacing=3,
-            skip_probability=0.2,
-            min_skip_frames=10,
-            max_skip_frames=30
+            parent_sequence_path,
+            frame_spacing=10,
+            skip_probability=0.20,
+            min_skip_frames=30,
+            max_skip_frames=50
         )
         np.save(depth_data_path, depth_data_seq)
         np.save(pose_data_path, pose_data_seq)
@@ -302,7 +305,7 @@ if __name__ == "__main__":
     # 2) Initialize & Train Model
     # ---------------------------
     model = DepthPoseEstimationNN().to(device)  # Move model to GPU
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.25e-3)
     pose_loss_fn = nn.MSELoss()
     seq_loss_fn = nn.BCELoss()
 
@@ -314,7 +317,8 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
     else:
         print("Training model...")
-        num_epochs = 60
+        num_epochs = 100
+        best_val_loss = float('inf')
         for epoch in range(num_epochs):
             model.train()
             train_loss = 0.0
@@ -332,11 +336,35 @@ if __name__ == "__main__":
                 optimizer.step()
                 train_loss += loss.item()
 
-            avg_train_loss = train_loss / len(train_loader)
-            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.8f}")
+            train_loss /= len(train_loader)
 
-        # Save trained model
-        torch.save(model.state_dict(), pretrained_model_path)
+            # Validation phase: do NOT backpropagate or update model parameters
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for d1, d2, d3, pose, seq_label in val_loader:
+                    d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
+                    pose = pose.to(device)
+                    seq_label = seq_label.to(device)
+
+                    pred_pose, pred_seq = model(d1, d2, d3)
+                    loss_pose = pose_loss_fn(pred_pose, pose)
+                    loss_seq = seq_loss_fn(pred_seq, seq_label)
+                    loss = lamda * loss_pose + (1 - lamda) * loss_seq
+                    val_loss += loss.item()
+
+            val_loss /= len(val_loader)
+
+            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.8f}, Val Loss: {val_loss:.8f}")
+
+            # Save best model based on validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
+                print(f"Saved best model at epoch {epoch + 1} with validation loss: {val_loss:.8f}")
+
+            
+        # torch.save(model.state_dict(), os.path.join(save_folder, "depth_pose_model.pth"))
 
     # ---------------------------
     # 3) Evaluate on Test Set

@@ -1,494 +1,269 @@
 import os
 import numpy as np
 import cv2
-import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader, random_split
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 # ---------------------------
-# Camera Intrinsic Matrix (TUM)
+# UNet Model for Depth Prediction
 # ---------------------------
-K = torch.tensor([
-    [525.0, 0.0, 319.5],
-    [0.0, 525.0, 239.5],
-    [0.0, 0.0, 1.0]
-], dtype=torch.float32)
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.double_conv(x)
 
-# ---------------------------
-# Quaternion Utilities
-# ---------------------------
-def quaternion_multiply(q1, q2):
-    """
-    Quaternion multiplication: q1 * q2
-    Each quaternion is [qx, qy, qz, qw].
-    """
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return np.array([
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    ])
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[32, 64, 128, 256]):
+        super(UNet, self).__init__()
+        self.downs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        current_in = in_channels
+        # Encoder: Downsampling path
+        for feature in features:
+            self.downs.append(DoubleConv(current_in, feature))
+            self.pools.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            current_in = feature
 
-def compute_relative_pose(pose1, pose2):
-    """
-    Compute relative pose from pose1 to pose2.
-    pose: [tx, ty, tz, qx, qy, qz, qw]
-    """
-    trans1, quat1 = pose1[:3], pose1[3:]
-    trans2, quat2 = pose2[:3], pose2[3:]
+        # Bottleneck
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
 
-    # Relative translation
-    relative_translation = trans2 - trans1
-
-    # Inverse of quat1
-    quat1_inv = np.array([-quat1[0], -quat1[1], -quat1[2], quat1[3]])
-    # Relative rotation
-    relative_rotation = quaternion_multiply(quat1_inv, quat2)
-
-    return np.hstack([relative_translation, relative_rotation])
-
-def quaternion_to_rotation_matrix(q):
-    """
-    Converts batched quaternions to rotation matrices.
-    q: [B, 4] => [B, 3, 3]
-    """
-    qx, qy, qz, qw = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    R = torch.zeros((q.shape[0], 3, 3), device=q.device)
-    R[:, 0, 0] = 1 - 2 * (qy**2 + qz**2)
-    R[:, 0, 1] = 2 * (qx * qy - qz * qw)
-    R[:, 0, 2] = 2 * (qx * qz + qy * qw)
-    R[:, 1, 0] = 2 * (qx * qy + qz * qw)
-    R[:, 1, 1] = 1 - 2 * (qx**2 + qz**2)
-    R[:, 1, 2] = 2 * (qy * qz - qx * qw)
-    R[:, 2, 0] = 2 * (qx * qz - qy * qw)
-    R[:, 2, 1] = 2 * (qy * qz + qx * qw)
-    R[:, 2, 2] = 1 - 2 * (qx**2 + qy**2)
-    return R
+        # Decoder: Upsampling path
+        self.ups = nn.ModuleList()
+        self.up_convs = nn.ModuleList()
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2))
+            self.up_convs.append(DoubleConv(feature*2, feature))
+        
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+    
+    def forward(self, x):
+        skip_connections = []
+        for down, pool in zip(self.downs, self.pools):
+            x = down(x)
+            skip_connections.append(x)
+            x = pool(x)
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+        for up, conv in zip(self.ups, self.up_convs):
+            x = up(x)
+            skip = skip_connections.pop(0)
+            if x.shape != skip.shape:
+                x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=True)
+            x = torch.cat([skip, x], dim=1)
+            x = conv(x)
+        return self.final_conv(x)
 
 # ---------------------------
-# Preprocessing with Skips
+# Preprocessing Function (Normal Order)
 # ---------------------------
-def preprocess_tum_sequence(
-        parent_sequence_path,
-        frame_spacing,
-        target_size=(128, 128),
-        skip_probability=0.2,
-        min_skip_frames=10,
-        max_skip_frames=30
-    ):
+def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_size=(128,128)):
     """
-    Creates triplets of frames spaced by 'frame_spacing', plus optional non-sequential data.
-    Example of sequential: i, i+frame_spacing, i+2*frame_spacing
-    For non-sequential, we skip extra frames for the 3rd image.
-    Returns:
-        depth_data: list of (depth1, depth2, depth3)
-        pose_data: list of [tx, ty, tz, qx, qy, qz, qw] (relative)
-        sequential_labels: list of 1 (sequential) or 0 (non-sequential)
+    For each sequence folder in normal sorted order:
+      - "dp": input depth images
+      - "depth": ground truth depth maps
+    We create triplets (i, i+frame_spacing, i+2*frame_spacing) from dp_files,
+    and for each triplet, we use depth_files[i+frame_spacing] as ground truth.
+    Only pairs up data when there are enough frames in both dp and depth.
     """
+    all_depth_inputs = []
+    all_depth_gts = []
     for sequence_folder in os.listdir(parent_sequence_path):
         sequence_path = os.path.join(parent_sequence_path, sequence_folder)
-        depth_dir = os.path.join(sequence_path, "depth")
-        groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
+        dp_folder = os.path.join(sequence_path, "dp")
+        depth_folder = os.path.join(sequence_path, "depth")
+        if not (os.path.exists(dp_folder) and os.path.exists(depth_folder)):
+            continue
 
-        # Load ground-truth poses
-        groundtruth = pd.read_csv(
-            groundtruth_file, sep=" ", header=None, comment="#",
-            names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]
-        )
+        dp_files = sorted([os.path.join(dp_folder, f) for f in os.listdir(dp_folder) if f.endswith(".png")])
+        depth_files = sorted([os.path.join(depth_folder, f) for f in os.listdir(depth_folder) if f.endswith(".png")])
 
-        depth_files = sorted(os.listdir(depth_dir))
-        depth_files = [os.path.join(depth_dir, f) for f in depth_files if f.endswith(".png")]
-
-        depth_data = []
-        pose_data = []
-        sequential_labels = []
-
-        # We need up to i + 2*frame_spacing
-        max_idx = len(depth_files) - 2 * frame_spacing
+        # Ensure that we have enough frames:
+        # - For dp: we need index i + 2*frame_spacing to exist.
+        # - For depth: we need index i + frame_spacing to exist.
+        max_idx = min(len(dp_files) - 2 * frame_spacing, len(depth_files) - frame_spacing)
         for i in range(max_idx):
-            depth1 = cv2.imread(depth_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            depth2 = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            depth3 = cv2.imread(depth_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            img1 = cv2.imread(dp_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            img2 = cv2.imread(dp_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            img3 = cv2.imread(dp_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            # Resize and normalize (example normalization: divide by 5000.0)
+            img1 = cv2.resize(img1, target_size) / 5000.0
+            img2 = cv2.resize(img2, target_size) / 5000.0
+            img3 = cv2.resize(img3, target_size) / 5000.0
+            all_depth_inputs.append((img1, img2, img3))
 
-            # Guard against zero max, just in case
-            max1, max2, max3 = np.max(depth1), np.max(depth2), np.max(depth3)
-            # Avoid division by zero
-            max1 = max1 if max1 > 0 else 1.0
-            max2 = max2 if max2 > 0 else 1.0
-            max3 = max3 if max3 > 0 else 1.0
+            gt_img = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
+            gt_img = cv2.resize(gt_img, target_size) / 5000.0
+            all_depth_gts.append(gt_img)
+    return all_depth_inputs, all_depth_gts
 
-            depth1 = cv2.resize(depth1, target_size) / max1
-            depth2 = cv2.resize(depth2, target_size) / max2
-            depth3 = cv2.resize(depth3, target_size) / max3
-
-            # Relative pose from frame i to frame i + 2*frame_spacing
-            pose1 = groundtruth.iloc[i][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
-            pose3 = groundtruth.iloc[i + 2 * frame_spacing][["tx", "ty", "tz", "qx", "qy", "qz", "qw"]].values
-            relative_pose = compute_relative_pose(pose1, pose3)
-
-            # This is the standard "sequential" sample
-            depth_data.append((depth1, depth2, depth3))
-            pose_data.append(relative_pose)
-            sequential_labels.append(1)  # 1 => sequential
-
-            # Possibly add a "non-sequential" sample
-            if np.random.rand() < skip_probability:
-                skip_frames = np.random.randint(min_skip_frames, max_skip_frames + 1)
-                # Make sure we don't exceed the dataset length
-                non_seq_index = i + 2 * frame_spacing + skip_frames
-                if non_seq_index < len(depth_files):
-                    # third image is now further away
-                    non_seq_depth3 = cv2.imread(depth_files[non_seq_index], cv2.IMREAD_UNCHANGED).astype(np.float32)
-                    m3 = np.max(non_seq_depth3)
-                    m3 = m3 if m3 > 0 else 1.0
-                    non_seq_depth3 = cv2.resize(non_seq_depth3, target_size) / m3
-
-                    # We'll reuse the same relative_pose for demonstration, 
-                    # but note that physically this might not match the frames.
-                    depth_data.append((depth1, depth2, non_seq_depth3))
-                    pose_data.append(relative_pose)
-                    sequential_labels.append(0)  # 0 => non-sequential
-
-    return depth_data, pose_data, sequential_labels
 
 # ---------------------------
 # Dataset Class
 # ---------------------------
-class DepthPoseDataset(Dataset):
-    def __init__(self, depth_data, pose_data, seq_labels):
-        self.depth_data = depth_data
-        self.pose_data = pose_data
-        self.seq_labels = seq_labels  # 1 => sequential, 0 => non-sequential
+class CachedDepthDataset(Dataset):
+    def __init__(self, depth_inputs, depth_gts):
+        self.depth_inputs = depth_inputs
+        self.depth_gts = depth_gts
 
     def __len__(self):
-        return len(self.depth_data)
+        return len(self.depth_inputs)
 
     def __getitem__(self, idx):
-        d1, d2, d3 = self.depth_data[idx]
-        pose = self.pose_data[idx]
-        seq_label = self.seq_labels[idx]
-
-        # Convert to torch tensors
-        d1 = torch.tensor(d1, dtype=torch.float32).unsqueeze(0)
-        d2 = torch.tensor(d2, dtype=torch.float32).unsqueeze(0)
-        d3 = torch.tensor(d3, dtype=torch.float32).unsqueeze(0)
-        pose = torch.tensor(pose, dtype=torch.float32)
-        seq_label = torch.tensor(seq_label, dtype=torch.float32).unsqueeze(0)
-
-        return d1, d2, d3, pose, seq_label
+        d1, d2, d3 = self.depth_inputs[idx]
+        d1 = np.asarray(d1, dtype=np.float32)
+        d2 = np.asarray(d2, dtype=np.float32)
+        d3 = np.asarray(d3, dtype=np.float32)
+        input_tensor = torch.tensor(np.stack([d1, d2, d3], axis=0), dtype=torch.float32)
+        gt_tensor = torch.tensor(np.asarray(self.depth_gts[idx], dtype=np.float32), dtype=torch.float32).unsqueeze(0)
+        return input_tensor, gt_tensor
 
 # ---------------------------
-# Model Definition
+# Training & Evaluation Functions
 # ---------------------------
-class DepthPoseEstimationNN(nn.Module):
-    """
-    Now returns both:
-        pred_pose: [tx, ty, tz, qx, qy, qz, qw]
-        pred_seq: Probability of the triplet being sequential (range ~ [0,1])
-    """
-    def __init__(self):
-        super(DepthPoseEstimationNN, self).__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+def train_epoch(model, loader, loss_fn, optimizer, device):
+    model.train()
+    epoch_loss = 0.0
+    for inputs, gt in loader:
+        inputs, gt = inputs.to(device), gt.to(device)
+        optimizer.zero_grad()
+        pred = model(inputs)
+        loss = loss_fn(pred, gt)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    return epoch_loss / len(loader)
 
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+def evaluate(model, loader, loss_fn, device):
+    model.eval()
+    epoch_loss = 0.0
+    with torch.no_grad():
+        for inputs, gt in loader:
+            inputs, gt = inputs.to(device), gt.to(device)
+            pred = model(inputs)
+            loss = loss_fn(pred, gt)
+            epoch_loss += loss.item()
+    return epoch_loss / len(loader)
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
-
-        # Shared fully-connected part
-        self.fc_pose1 = nn.Linear(128 * 8 * 8, 256)
-        self.fc_pose2 = nn.Linear(256, 128)
-        self.fc_pose_out = nn.Linear(128, 7)  # [tx, ty, tz, qx, qy, qz, qw]
-
-        # Classification head for sequential vs. non-sequential
-        self.fc_seq1 = nn.Linear(128 * 8 * 8, 128)
-        self.fc_seq2 = nn.Linear(128, 1)  # single probability
-
-    def forward(self, d1, d2, d3):
-        # Concatenate along channel dimension => [B, 3, 128, 128]
-        depth_input = torch.cat((d1, d2, d3), dim=1)
-        conv_out = self.conv_block(depth_input)
-        conv_out = conv_out.view(conv_out.size(0), -1)
-
-        # Pose branch
-        x_pose = F.relu(self.fc_pose1(conv_out))
-        x_pose = F.relu(self.fc_pose2(x_pose))
-        pred_pose = self.fc_pose_out(x_pose)
-
-        # Seq classification branch
-        x_seq = F.relu(self.fc_seq1(conv_out))
-        pred_seq = torch.sigmoid(self.fc_seq2(x_seq))  # Probability in [0,1]
-
-        return pred_pose, pred_seq
-
+def visualize_predictions(model, loader, device, num_samples=6):
+    model.eval()
+    inputs, gt = next(iter(loader))
+    inputs, gt = inputs.to(device), gt.to(device)
+    with torch.no_grad():
+        pred = model(inputs)
+    
+    inputs = inputs.cpu().numpy()  # shape: [B, 3, H, W]
+    gt = gt.cpu().numpy()          # shape: [B, 1, H, W]
+    pred = pred.cpu().numpy()      # shape: [B, 1, H, W]
+    
+    n_examples = min(num_samples, inputs.shape[0])
+    fig, axs = plt.subplots(n_examples, 3, figsize=(18, 4 * n_examples))
+    if n_examples == 1:
+        axs = np.expand_dims(axs, axis=0)
+    
+    for i in range(n_examples):
+        # Display the middle input depth map (channel index 1)
+        im_input = axs[i, 0].imshow(inputs[i, 1, :, :], cmap='viridis')
+        axs[i, 0].set_title("Input Depth (Middle dp)")
+        axs[i, 0].axis("off")
+        fig.colorbar(im_input, ax=axs[i, 0])
+        
+        # Display Ground Truth depth map
+        im_gt = axs[i, 1].imshow(gt[i, 0, :, :], cmap='viridis')
+        axs[i, 1].set_title("Ground Truth Depth")
+        axs[i, 1].axis("off")
+        fig.colorbar(im_gt, ax=axs[i, 1])
+        
+        # Display Predicted depth map
+        im_pred = axs[i, 2].imshow(pred[i, 0, :, :], cmap='viridis')
+        axs[i, 2].set_title("Predicted Depth")
+        axs[i, 2].axis("off")
+        fig.colorbar(im_pred, ax=axs[i, 2])
+    
+    plt.tight_layout()
+    plt.show()
 
 # ---------------------------
-# Main Script with CUDA Support
+# Main Script
 # ---------------------------
-
 if __name__ == "__main__":
-    # Use GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Directory of this file
-    data_dir = os.path.dirname(__file__)
-    save_folder = os.path.join(data_dir, "saved_data_6")
+    data_dir = os.path.dirname(os.path.abspath(__file__))
+    save_folder = os.path.join(data_dir, "saved_data_7")
     os.makedirs(save_folder, exist_ok=True)
     parent_sequence_path = os.path.join(data_dir, "tnt_data")
 
-    # Numpy files for caching
-    depth_data_path = os.path.join(save_folder, "depth_data_seq.npy")
-    pose_data_path = os.path.join(save_folder, "pose_data_seq.npy")
-    seq_labels_path = os.path.join(save_folder, "seq_labels_seq.npy")
+    input_cache_path = os.path.join(save_folder, "depth_input_seq.npy")
+    gt_cache_path = os.path.join(save_folder, "depth_gt_seq.npy")
 
-    # ---------------------------
-    # 1) Prepare data (with skipping)
-    # ---------------------------
-    if (
-        os.path.exists(depth_data_path)
-        and os.path.exists(pose_data_path)
-        and os.path.exists(seq_labels_path)
-    ):
-        print("Loading cached data...")
-        depth_data_seq = np.load(depth_data_path, allow_pickle=True)
-        pose_data_seq = np.load(pose_data_path, allow_pickle=True)
-        seq_labels_seq = np.load(seq_labels_path, allow_pickle=True)
+    if os.path.exists(input_cache_path) and os.path.exists(gt_cache_path):
+        print("Loading cached depth data...")
+        depth_input_seq = np.load(input_cache_path, allow_pickle=True)
+        depth_gt_seq = np.load(gt_cache_path, allow_pickle=True)
     else:
-        print("Preprocessing TUM sequence with skipping...")
-        depth_data_seq, pose_data_seq, seq_labels_seq = preprocess_tum_sequence(
-            parent_sequence_path,
-            frame_spacing=10,
-            skip_probability=0.2,
-            min_skip_frames=50,
-            max_skip_frames=80
+        print("Preprocessing depth sequences from TUM data...")
+        depth_input_seq, depth_gt_seq = preprocess_depth_sequence(
+            parent_sequence_path, frame_spacing=10, target_size=(128, 128)
         )
-        np.save(depth_data_path, depth_data_seq)
-        np.save(pose_data_path, pose_data_seq)
-        np.save(seq_labels_path, seq_labels_seq)
+        np.save(input_cache_path, np.array(depth_input_seq, dtype=object))
+        np.save(gt_cache_path, np.array(depth_gt_seq, dtype=object))
 
-    # Split into train/val/test
-    train_depth, val_depth, train_pose, val_pose, train_labels, val_labels = train_test_split(
-        depth_data_seq, pose_data_seq, seq_labels_seq, test_size=0.2, random_state=42
+    dataset = CachedDepthDataset(depth_input_seq, depth_gt_seq)
+    total_samples = len(dataset)
+    train_size = int(0.7 * total_samples)
+    val_size = int(0.15 * total_samples)
+    test_size = total_samples - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(42)
     )
-    val_depth, test_depth, val_pose, test_pose, val_labels, test_labels = train_test_split(
-        val_depth, val_pose, val_labels, test_size=0.5, random_state=42
-    )
-
-    train_dataset = DepthPoseDataset(train_depth, train_pose, train_labels)
-    val_dataset = DepthPoseDataset(val_depth, val_pose, val_labels)
-    test_dataset = DepthPoseDataset(test_depth, test_pose, test_labels)
-
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
-    # ---------------------------
-    # 2) Initialize & Train Model
-    # ---------------------------
-    model = DepthPoseEstimationNN().to(device)  # Move model to GPU
+    model = UNet(in_channels=3, out_channels=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    pose_loss_fn = nn.MSELoss()
-    seq_loss_fn = nn.BCELoss()
+    loss_fn = nn.MSELoss()
 
-    lamda = 0.7
-
-    pretrained_model_path = os.path.join(save_folder, "depth_pose_model.pth")
-    if os.path.exists(pretrained_model_path):
+    checkpoint_path = os.path.join(save_folder, "unet_depth_model.pth")
+    skip_training = False
+    if os.path.exists(checkpoint_path):
         print("Loading pretrained model...")
-        model.load_state_dict(torch.load(pretrained_model_path, map_location=device))
-    else:
-        print("Training model...")
-        num_epochs = 60
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        skip_training = True
+
+    if not skip_training:
+        num_epochs = 100
+        patience = 10
+        epochs_without_improvement = 0
         best_val_loss = float('inf')
         for epoch in range(num_epochs):
-            model.train()
-            train_loss = 0.0
-            for d1, d2, d3, pose, seq_label in train_loader:
-                d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
-                pose = pose.to(device)
-                seq_label = seq_label.to(device)
+            train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
+            val_loss = evaluate(model, val_loader, loss_fn, device)
+            print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), checkpoint_path)
+                print(f"Saved best model at epoch {epoch+1} with val loss: {val_loss:.4f}")
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    print(f"Early stopping triggered at epoch {epoch+1}")
+                    break
 
-                optimizer.zero_grad()
-                pred_pose, pred_seq = model(d1, d2, d3)
-                loss_pose = pose_loss_fn(pred_pose, pose)
-                loss_seq = seq_loss_fn(pred_seq, seq_label)
-                loss = lamda * loss_pose + (1 - lamda) * loss_seq
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-
-            avg_train_loss = train_loss / len(train_loader)
-
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for d1, d2, d3, pose, seq_label in val_loader:
-                    d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
-                    pose = pose.to(device)
-                    seq_label = seq_label.to(device)
-
-                    pred_pose, pred_seq = model(d1, d2, d3)
-                    loss_pose = pose_loss_fn(pred_pose, pose)
-                    loss_seq = seq_loss_fn(pred_seq, seq_label)
-                    loss = lamda * loss_pose + (1 - lamda) * loss_seq
-                    val_loss += loss.item()
-
-            avg_val_loss = val_loss / len(val_loader)
-            
-            print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-
-            # Save model if validation loss has decreased
-            if avg_val_loss < best_val_loss:
-                print(f"Validation loss decreased from {best_val_loss:.8f} to {avg_val_loss:.8f}")
-                best_val_loss = avg_val_loss
-                torch.save(model.state_dict(), pretrained_model_path)
-
-
-    # ---------------------------
-    # 3) Evaluate on Test Set
-    # ---------------------------
-    print("\nEvaluating on test set...")
-    test_loss = 0.0
-    true_vals, pred_vals = [], []
-    true_seq, pred_seq = [], []
-
-    model.eval()
-    with torch.no_grad():
-        for d1, d2, d3, pose, seq_label in test_loader:
-            d1, d2, d3 = d1.to(device), d2.to(device), d3.to(device)
-            pose = pose.to(device)
-            seq_label = seq_label.to(device)
-
-            pred_pose, pred_seq_logits = model(d1, d2, d3)
-            loss_pose = pose_loss_fn(pred_pose, pose)
-            loss_seq = seq_loss_fn(pred_seq_logits, seq_label)
-            loss = loss_pose + loss_seq
-            test_loss += loss.item()
-
-            true_vals.append(pose.cpu().numpy())
-            pred_vals.append(pred_pose.cpu().numpy())
-
-            true_seq.append(seq_label.cpu().numpy())
-            pred_seq.append(pred_seq_logits.cpu().numpy())
-
-    test_loss /= len(test_loader)
+    test_loss = evaluate(model, test_loader, loss_fn, device)
     print(f"Test Loss: {test_loss:.4f}")
-
-    # Convert to numpy arrays for analysis
-    true_vals = np.vstack(true_vals)
-    pred_vals = np.vstack(pred_vals)
-    true_seq = np.vstack(true_seq)
-    pred_seq = np.vstack(pred_seq)
-
-    # ---------------------------
-    # 4) Visualizations
-    # ---------------------------
-    # 4a) Pose Prediction Plot
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # Required for 3D plotting
-
-    def plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=None):
-        """
-        Plots 2D subplots for each pose component and a 3D path plot for the translation components.
-        
-        Parameters:
-        - true_vals: numpy array of ground truth pose values, shape (N, 7)
-        - pred_vals: numpy array of predicted pose values, shape (N, 7)
-        - sample_range: int, number of samples to plot for the 2D plots (default: 60)
-        - sample_range_3d: int, number of samples to plot for the 3D path plot.
-                        If None, it will use sample_range.
-        """
-        if sample_range_3d is None:
-            sample_range_3d = sample_range
-
-        # Titles for each pose component (first 3 are translations, last 4 are rotations)
-        titles = [
-            "Translation X (tx)", "Translation Y (ty)", "Translation Z (tz)",
-            "Rotation X (qx)", "Rotation Y (qy)", "Rotation Z (qz)", "Rotation W (qw)"
-        ]
-        num_components = true_vals.shape[1]
-        
-        # Create subplots for each pose component (2D plots)
-        fig, axes = plt.subplots(num_components, 1, figsize=(10, 2 * num_components), sharex=True)
-        for i in range(num_components):
-            axes[i].plot(true_vals[:sample_range, i], label='Ground Truth',
-                        marker='o', markersize=3, linestyle='-')
-            axes[i].plot(pred_vals[:sample_range, i], label='Predicted',
-                        marker='x', markersize=3, linestyle='--')
-            axes[i].set_ylabel(titles[i])
-            axes[i].legend()
-            axes[i].grid(True)
-        axes[-1].set_xlabel("Sample Index")
-        fig.suptitle("Ground Truth vs Predicted Pose Components", fontsize=16)
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
-        
-        # Create a separate figure for the 3D path plot (using translation components)
-        fig_3d = plt.figure(figsize=(10, 8))
-        ax = fig_3d.add_subplot(111, projection='3d')
-        ax.plot(true_vals[:sample_range_3d, 0], 
-                true_vals[:sample_range_3d, 1], 
-                true_vals[:sample_range_3d, 2],
-                label='Ground Truth Path', marker='o', markersize=4, linestyle='-')
-        ax.plot(pred_vals[:sample_range_3d, 0], 
-                pred_vals[:sample_range_3d, 1], 
-                pred_vals[:sample_range_3d, 2],
-                label='Predicted Path', marker='x', markersize=4, linestyle='--')
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_title("3D Path: Ground Truth vs Predicted")
-        ax.legend()
-        
-        # Display both figures
-        plt.show()
-
-
-    # 4b) Sequential vs Non-sequential Classification
-    from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
-    import seaborn as sns
-
-    def plot_sequential_classification(true_seq, pred_seq):
-        # Binarize predictions with threshold=0.5
-        pred_seq_binary = (pred_seq >= 0.5).astype(int)
-
-        # Accuracy
-        accuracy = accuracy_score(true_seq, pred_seq_binary)
-        print(f"Sequential Classification Accuracy: {accuracy:.4f}")
-
-        # Classification report
-        print("\nClassification Report:")
-        print(classification_report(true_seq, pred_seq_binary,
-                                    target_names=["Non-Sequential (0)", "Sequential (1)"]))
-
-        # Confusion matrix
-        cm = confusion_matrix(true_seq, pred_seq_binary)
-        plt.figure(figsize=(6, 5))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                    xticklabels=["Non-Seq (0)", "Seq (1)"],
-                    yticklabels=["Non-Seq (0)", "Seq (1)"])
-        plt.title("Confusion Matrix")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.show()
-
-    # Plot results
-    plot_pose_predictions(true_vals, pred_vals, sample_range=60, sample_range_3d=5)
-    plot_sequential_classification(true_seq, pred_seq)
+    visualize_predictions(model, test_loader, device, num_samples=2)

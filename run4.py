@@ -83,7 +83,7 @@ def preprocess_tum_sequence(parent_sequence_path, frame_spacing, target_size=(12
     for sequence_folder in os.listdir(parent_sequence_path):
         sequence_path = os.path.join(parent_sequence_path, sequence_folder)
 
-        depth_dir = os.path.join(sequence_path, "depth")
+        depth_dir = os.path.join(sequence_path, "da2")
         groundtruth_file = os.path.join(sequence_path, "groundtruth.txt")
 
         # Load ground-truth poses

@@ -6,6 +6,8 @@ run 5 combines triplets, overlap indicator, and skips in the processing of the x
 
 run 6 switched to pairs again, but now with images and depth maps as the inputs
 
+run 7 is UNet attempt
+
 NEED TO:
  - add more data to the training and testing
  - if there is a scene skip it does not try to estimate the pose, uses pairs of depth maps and images
