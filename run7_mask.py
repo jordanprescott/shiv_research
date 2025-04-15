@@ -6,8 +6,6 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import cv2.ximgproc as xip
-import numpy as np
 
 # ---------------------------
 # UNet Model for Depth Prediction
@@ -48,7 +46,11 @@ class UNet(nn.Module):
             self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2))
             self.up_convs.append(DoubleConv(feature*2, feature))
         
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        # Use Softplus so the predictions are positive but not forced to zero
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(features[0], out_channels, kernel_size=1),
+            nn.Softplus()
+        )
     
     def forward(self, x):
         skip_connections = []
@@ -68,16 +70,16 @@ class UNet(nn.Module):
         return self.final_conv(x)
 
 # ---------------------------
-# Preprocessing Function (Normal Order)
+# Preprocessing Function (with Inpainting for GT)
 # ---------------------------
 def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_size=(128,128)):
     """
-    For each sequence folder in normal sorted order:
+    For each sequence folder:
       - "dp": input depth images
       - "depth": ground truth depth maps
-    We create triplets (i, i+frame_spacing, i+2*frame_spacing) from dp_files,
-    and for each triplet, we use depth_files[i+frame_spacing] as ground truth.
-    Only pairs up data when there are enough frames in both dp and depth.
+    Create triplets (i, i+frame_spacing, i+2*frame_spacing) from dp_files,
+    and use depth_files[i+frame_spacing] as ground truth.
+    Applies inpainting to the ground truth to fill zero regions.
     """
     all_depth_inputs = []
     all_depth_gts = []
@@ -91,22 +93,24 @@ def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_siz
         dp_files = sorted([os.path.join(dp_folder, f) for f in os.listdir(dp_folder) if f.endswith(".png")])
         depth_files = sorted([os.path.join(depth_folder, f) for f in os.listdir(depth_folder) if f.endswith(".png")])
 
-        # Ensure that we have enough frames:
-        # - For dp: we need index i + 2*frame_spacing to exist.
-        # - For depth: we need index i + frame_spacing to exist.
         max_idx = min(len(dp_files) - 2 * frame_spacing, len(depth_files) - frame_spacing)
         for i in range(max_idx):
+            # Process dp images (using linear interpolation)
             img1 = cv2.imread(dp_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
             img2 = cv2.imread(dp_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
             img3 = cv2.imread(dp_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            # Resize and normalize (example normalization: divide by 5000.0)
-            img1 = cv2.resize(img1, target_size) / 5000.0
-            img2 = cv2.resize(img2, target_size) / 5000.0
-            img3 = cv2.resize(img3, target_size) / 5000.0
+            img1 = cv2.resize(img1, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
+            img2 = cv2.resize(img2, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
+            img3 = cv2.resize(img3, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
             all_depth_inputs.append((img1, img2, img3))
 
+            # Process ground truth depth map (using nearest-neighbor to preserve zeros)
             gt_img = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            gt_img = cv2.resize(gt_img, target_size) / 5000.0
+            gt_img = cv2.resize(gt_img, target_size, interpolation=cv2.INTER_NEAREST) / 5000.0
+            # Inpaint missing regions where gt is zero
+            mask = (gt_img == 0).astype(np.uint8)
+            if np.count_nonzero(mask) > 0:
+                gt_img = cv2.inpaint(gt_img, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
             all_depth_gts.append(gt_img)
     return all_depth_inputs, all_depth_gts
 
@@ -131,89 +135,23 @@ class CachedDepthDataset(Dataset):
         return input_tensor, gt_tensor
 
 # ---------------------------
-# Custom Masked Loss Function
+# Loss Functions
 # ---------------------------
 def masked_mse_loss(pred, gt, mask_value=0.0):
-    """
-    Computes the Mean Squared Error only over the pixels where gt != mask_value.
-    """
-    mask = (gt != mask_value).float()  # valid pixels are marked as 1, invalid as 0
+    mask = (gt > mask_value).float()
     diff = (pred - gt) ** 2
     loss = (diff * mask).sum() / (mask.sum() + 1e-6)
     return loss
 
-# ---------------------------
-# Postprocessing Functions
-# ---------------------------
-def fill_missing_depth(pred_depth, input_depth):
-    """
-    Fills missing depth values (zeros) in the predicted depth map using an affine
-    transformation derived from the nonzero predictions and the corresponding input depth values.
-    
-    Parameters:
-      pred_depth (np.ndarray): Predicted depth map with missing values as 0. Shape (H, W).
-      input_depth (np.ndarray): Input depth map. Shape (H, W).
-    
-    Returns:
-      np.ndarray: The filled predicted depth map.
-    """
-    # Create a mask for valid predicted depth values (nonzero)
-    valid_mask = pred_depth > 0
-    
-    # Check if there are enough valid pixels to compute the transformation
-    if np.sum(valid_mask) < 10:
-        print("Not enough valid pixels to compute the affine transformation.")
-        return pred_depth
+def gradient_loss(pred):
+    dx = pred[..., :, 1:] - pred[..., :, :-1]
+    dy = pred[..., 1:, :] - pred[..., :-1, :]
+    return dx.abs().mean() + dy.abs().mean()
 
-    # Extract the corresponding values from input and predicted depth maps
-    x = input_depth[valid_mask].flatten()
-    y = pred_depth[valid_mask].flatten()
-    
-    # Compute the affine transformation parameters using linear regression (polyfit with degree 1)
-    a, b = np.polyfit(x, y, 1)
-    print(f"Computed affine transformation: a = {a:.4f}, b = {b:.4f}")
-
-    # Create a copy of the predicted depth map to modify
-    pred_depth_filled = pred_depth.copy()
-    
-    # Identify where predicted depth is zero (missing data)
-    missing_mask = pred_depth < 0.25
-    
-    # Apply the affine transformation to the corresponding input depth values to fill the gaps
-    pred_depth_filled[missing_mask] = a * input_depth[missing_mask] + b
-    
-    return pred_depth_filled
-
-# Example usage:
-# Suppose pred_depth_map and input_depth_map are numpy arrays of shape (H, W)
-# pred_depth_map_filled = fill_missing_depth(pred_depth_map, input_depth_map)
-
-def refine_input_with_guided_filter(input_depth, predicted_depth, radius=5, eps=0.01):
-    """
-    Refine the input depth map using guided filtering, where the predicted depth map
-    serves as the guidance image.
-
-    Args:
-        input_depth (np.ndarray): The input depth map (2D array).
-        predicted_depth (np.ndarray): The predicted depth map (2D array) used as the guide.
-        radius (int): Radius for the guided filter (controls neighborhood size).
-        eps (float): Regularization parameter to control smoothness.
-
-    Returns:
-        np.ndarray: The refined depth map.
-    """
-    # Ensure the images are in float32 format.
-    input_depth = input_depth.astype(np.float32)
-    predicted_depth = predicted_depth.astype(np.float32)
-
-    # Create a guided filter using the predicted depth as guidance.
-    guided_filter = xip.createGuidedFilter(guide=predicted_depth, radius=radius, eps=eps)
-    refined_depth = guided_filter.filter(input_depth)
-    return refined_depth
-
-# Example usage:
-# refined = refine_input_with_guided_filter(input_depth, predicted_depth)
-
+def combined_loss(pred, gt, alpha=0.1):
+    mse = masked_mse_loss(pred, gt)
+    grad = gradient_loss(pred)
+    return mse + alpha * grad
 
 # ---------------------------
 # Training & Evaluation Functions
@@ -252,57 +190,45 @@ def visualize_predictions(model, loader, device, num_samples=6):
     inputs = inputs.cpu().numpy()  # shape: [B, 3, H, W]
     gt = gt.cpu().numpy()          # shape: [B, 1, H, W]
     pred = pred.cpu().numpy()      # shape: [B, 1, H, W]
-
-    pred_filled = []
-    for i in range(num_samples):
-        pred_filled.append(fill_missing_depth(pred[i, 0, :, :], inputs[i, 1, :, :]))
-    pred_filled = np.stack(pred_filled, axis=0)
-
-    refined_inputs = []
-    for i in range(num_samples):
-        refined_inputs.append(refine_input_with_guided_filter(inputs[i, 1, :, :], pred[i, 0, :, :]))
-    refined_inputs = np.stack(refined_inputs, axis=0)
-
     
     n_examples = min(num_samples, inputs.shape[0])
-    fig, axs = plt.subplots(n_examples, 4, figsize=(18, 4 * n_examples))
+    fig, axs = plt.subplots(n_examples, 5, figsize=(22, 4 * n_examples))
+    # If only one example is plotted, ensure axs is 2D
     if n_examples == 1:
         axs = np.expand_dims(axs, axis=0)
     
     for i in range(n_examples):
-        # Display the middle input depth map (channel index 1)
-        im_input = axs[i, 0].imshow(inputs[i, 1, :, :], cmap='viridis')
-        axs[i, 0].set_title("Input Depth (Middle dp)")
+        # Plot each of the 3 input dp images
+        im_dp0 = axs[i, 0].imshow(inputs[i, 0, :, :], cmap='plasma')
+        axs[i, 0].set_title("Input Depth 1 (dp 1)")
         axs[i, 0].axis("off")
-        fig.colorbar(im_input, ax=axs[i, 0])
+        fig.colorbar(im_dp0, ax=axs[i, 0])
         
-        # Display Ground Truth depth map
-        im_gt = axs[i, 1].imshow(gt[i, 0, :, :], cmap='viridis')
-        axs[i, 1].set_title("Ground Truth Depth")
+        im_dp1 = axs[i, 1].imshow(inputs[i, 1, :, :], cmap='plasma')
+        axs[i, 1].set_title("Input Depth 2 (dp 2)")
         axs[i, 1].axis("off")
-        fig.colorbar(im_gt, ax=axs[i, 1])
+        fig.colorbar(im_dp1, ax=axs[i, 1])
         
-        # Display Predicted depth map
-        im_pred = axs[i, 2].imshow(pred[i, 0, :, :], cmap='viridis')
-        axs[i, 2].set_title("Predicted Depth")
+        im_dp2 = axs[i, 2].imshow(inputs[i, 2, :, :], cmap='plasma')
+        axs[i, 2].set_title("Input Depth 3 (dp 3)")
         axs[i, 2].axis("off")
-        fig.colorbar(im_pred, ax=axs[i, 2])
-
-        # Display Filled Predicted depth map
-        im_pred_filled = axs[i, 3].imshow(pred_filled[i, :, :], cmap='viridis')
-        axs[i, 3].set_title("Predicted Depth (Filled)")
+        fig.colorbar(im_dp2, ax=axs[i, 2])
+        
+        # Plot the ground truth depth
+        im_gt = axs[i, 3].imshow(gt[i, 0, :, :], cmap='plasma')
+        axs[i, 3].set_title("Ground Truth Depth")
         axs[i, 3].axis("off")
-        fig.colorbar(im_pred_filled, ax=axs[i, 3])
-
-        # # Display Refined Input depth map
-        # im_refined = axs[i, 4].imshow(refined_inputs[i, :, :], cmap='viridis')
-        # axs[i, 4].set_title("Refined Input Depth")
-        # axs[i, 4].axis("off")
-        # fig.colorbar(im_refined, ax=axs[i, 4])
-
+        fig.colorbar(im_gt, ax=axs[i, 3])
+        
+        # Plot the predicted depth
+        im_pred = axs[i, 4].imshow(pred[i, 0, :, :], cmap='plasma')
+        axs[i, 4].set_title("Predicted Depth")
+        axs[i, 4].axis("off")
+        fig.colorbar(im_pred, ax=axs[i, 4])
     
     plt.tight_layout()
     plt.show()
+
 
 # ---------------------------
 # Main Script
@@ -312,7 +238,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     data_dir = os.path.dirname(os.path.abspath(__file__))
-    save_folder = os.path.join(data_dir, "saved_data_7")
+    save_folder = os.path.join(data_dir, "saved_data_7_inpaint")
     os.makedirs(save_folder, exist_ok=True)
     parent_sequence_path = os.path.join(data_dir, "tnt_data")
 
@@ -324,7 +250,7 @@ if __name__ == "__main__":
         depth_input_seq = np.load(input_cache_path, allow_pickle=True)
         depth_gt_seq = np.load(gt_cache_path, allow_pickle=True)
     else:
-        print("Preprocessing depth sequences from TUM data...")
+        print("Preprocessing depth sequences from TUM data with inpainting...")
         depth_input_seq, depth_gt_seq = preprocess_depth_sequence(
             parent_sequence_path, frame_spacing=10, target_size=(128, 128)
         )
@@ -345,10 +271,8 @@ if __name__ == "__main__":
 
     model = UNet(in_channels=3, out_channels=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
-
-    # loss_fn = masked_mse_loss
-
+    # loss_fn = combined_loss  # Using the combined loss (masked MSE + gradient loss)
+    loss_fn = masked_mse_loss  # Using only masked MSE loss
 
     checkpoint_path = os.path.join(save_folder, "unet_depth_model.pth")
     skip_training = False
