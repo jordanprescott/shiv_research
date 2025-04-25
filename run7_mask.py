@@ -70,7 +70,7 @@ class UNet(nn.Module):
         return self.final_conv(x)
 
 # ---------------------------
-# Preprocessing Function (with Inpainting for GT)
+# Preprocessing Function
 # ---------------------------
 def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_size=(128,128)):
     """
@@ -79,7 +79,6 @@ def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_siz
       - "depth": ground truth depth maps
     Create triplets (i, i+frame_spacing, i+2*frame_spacing) from dp_files,
     and use depth_files[i+frame_spacing] as ground truth.
-    Applies inpainting to the ground truth to fill zero regions.
     """
     all_depth_inputs = []
     all_depth_gts = []
@@ -99,18 +98,14 @@ def preprocess_depth_sequence(parent_sequence_path, frame_spacing=10, target_siz
             img1 = cv2.imread(dp_files[i], cv2.IMREAD_UNCHANGED).astype(np.float32)
             img2 = cv2.imread(dp_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
             img3 = cv2.imread(dp_files[i + 2 * frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            img1 = cv2.resize(img1, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
-            img2 = cv2.resize(img2, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
-            img3 = cv2.resize(img3, target_size, interpolation=cv2.INTER_LINEAR) / 5000.0
+            img1 = cv2.resize(img1, target_size, interpolation=cv2.INTER_LINEAR)
+            img2 = cv2.resize(img2, target_size, interpolation=cv2.INTER_LINEAR)
+            img3 = cv2.resize(img3, target_size, interpolation=cv2.INTER_LINEAR)
             all_depth_inputs.append((img1, img2, img3))
 
             # Process ground truth depth map (using nearest-neighbor to preserve zeros)
             gt_img = cv2.imread(depth_files[i + frame_spacing], cv2.IMREAD_UNCHANGED).astype(np.float32)
-            gt_img = cv2.resize(gt_img, target_size, interpolation=cv2.INTER_NEAREST) / 5000.0
-            # Inpaint missing regions where gt is zero
-            mask = (gt_img == 0).astype(np.uint8)
-            if np.count_nonzero(mask) > 0:
-                gt_img = cv2.inpaint(gt_img, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            gt_img = cv2.resize(gt_img, target_size, interpolation=cv2.INTER_NEAREST)
             all_depth_gts.append(gt_img)
     return all_depth_inputs, all_depth_gts
 
@@ -138,10 +133,19 @@ class CachedDepthDataset(Dataset):
 # Loss Functions
 # ---------------------------
 def masked_mse_loss(pred, gt, mask_value=0.0):
-    mask = (gt > mask_value).float()
-    diff = (pred - gt) ** 2
-    loss = (diff * mask).sum() / (mask.sum() + 1e-6)
-    return loss
+    """
+    Computes MSE over pixels where gt != mask_value using indexing to prevent
+    gradient flow through masked-out (invalid) pixels.
+    """
+    valid_mask = gt != mask_value
+    pred_valid = pred[valid_mask]
+    gt_valid = gt[valid_mask]
+    
+    if pred_valid.numel() == 0:
+        # No valid pixels, return 0 loss but keep it differentiable
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    
+    return F.mse_loss(pred_valid, gt_valid)
 
 def gradient_loss(pred):
     dx = pred[..., :, 1:] - pred[..., :, :-1]
@@ -152,6 +156,8 @@ def combined_loss(pred, gt, alpha=0.1):
     mse = masked_mse_loss(pred, gt)
     grad = gradient_loss(pred)
     return mse + alpha * grad
+
+
 
 # ---------------------------
 # Training & Evaluation Functions
@@ -238,7 +244,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     data_dir = os.path.dirname(os.path.abspath(__file__))
-    save_folder = os.path.join(data_dir, "saved_data_7_inpaint")
+    save_folder = os.path.join(data_dir, "saved_data_7_mask")
     os.makedirs(save_folder, exist_ok=True)
     parent_sequence_path = os.path.join(data_dir, "tnt_data")
 
@@ -250,7 +256,7 @@ if __name__ == "__main__":
         depth_input_seq = np.load(input_cache_path, allow_pickle=True)
         depth_gt_seq = np.load(gt_cache_path, allow_pickle=True)
     else:
-        print("Preprocessing depth sequences from TUM data with inpainting...")
+        print("Preprocessing depth sequences from TUM data ...")
         depth_input_seq, depth_gt_seq = preprocess_depth_sequence(
             parent_sequence_path, frame_spacing=10, target_size=(128, 128)
         )
@@ -282,7 +288,7 @@ if __name__ == "__main__":
         skip_training = True
 
     if not skip_training:
-        num_epochs = 30
+        num_epochs = 10
         patience = 10
         epochs_without_improvement = 0
         best_val_loss = float('inf')

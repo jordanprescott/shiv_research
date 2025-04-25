@@ -1,223 +1,491 @@
 import os
-import glob
-from PIL import Image
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.optim as optim
 import matplotlib.pyplot as plt
+import imageio
+from torch.utils.data import Subset
+from partialconv.models.partialconv2d import PartialConv2d
 
-# -------------------------
-# Define the U-Net model
-# -------------------------
-class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, init_features=64):
-        super(UNet, self).__init__()
-        features = init_features
 
-        # Encoder (downsampling path)
-        self.encoder1 = UNet._block(in_channels, features)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder2 = UNet._block(features, features * 2)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder3 = UNet._block(features * 2, features * 4)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder4 = UNet._block(features * 4, features * 8)
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+# ---------------------------
+# 1. Preprocessing Functions
+# ---------------------------
+def preprocess_depth_sequence(parent_sequence_path, frame_spacing=3, target_size=(128,128)):
+    """
+    For each sequence:
+      - "dp" holds raw depth frames
+      - "depth" holds ground‑truth depth maps
+    Builds triplets (i, i+frame_spacing, i+2*frame_spacing) from dp,
+    uses the middle frame in "depth" as GT, resizes, normalizes by 5000.0,
+    and returns two lists: inputs and targets.
+    """
+    all_inputs, all_gts = [], []
+    for seq in os.listdir(parent_sequence_path):
+        if seq == "rgbd_scenenet":
+            print(f"Skipping {seq}...")
+            continue
+        print(f"Processing {seq}...")
+        dp_folder    = os.path.join(parent_sequence_path, seq, "dp")
+        gt_folder    = os.path.join(parent_sequence_path, seq, "depth")
+        if not (os.path.isdir(dp_folder) and os.path.isdir(gt_folder)):
+            continue
+
+        dp_files  = sorted(f for f in os.listdir(dp_folder)  if f.endswith(".png"))
+        gt_files  = sorted(f for f in os.listdir(gt_folder) if f.endswith(".png"))
+        max_idx = min(len(dp_files) - 2*frame_spacing, len(gt_files) - frame_spacing)
+
+        for i in range(max_idx):
+            # Load three input depth maps
+            imgs = []
+            for offset in (0, frame_spacing, 2*frame_spacing):
+                path = os.path.join(dp_folder, dp_files[i + offset])
+                img  = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.float32)  # OpenCV imread :contentReference[oaicite:2]{index=2}
+                img  = cv2.resize(img, target_size)
+                imgs.append(img)
+            all_inputs.append(tuple(imgs))
+
+            # Load GT for middle frame
+            gt_path = os.path.join(gt_folder, gt_files[i + frame_spacing])
+            gt_img   = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+            gt_img   = cv2.resize(gt_img, target_size) / 5000.0  # Normalize by 5000.0 to convert ground truth to meters
+            all_gts.append(gt_img)
+    return all_inputs, all_gts
+
+def preprocess_depth_sequence_scenenet(parent_sequence_path, frame_spacing=3, target_size=(128,128)):
+    """
+    For each sequence:
+      - "dp" holds raw depth frames
+      - "depth" holds ground‑truth depth maps
+    Builds triplets (i, i+frame_spacing, i+2*frame_spacing) from dp,
+    uses the middle frame in "depth" as GT, resizes, normalizes by 5000.0,
+    and returns two lists: inputs and targets.
+    """
+    all_inputs, all_gts = [], []
+    # seq = os.listdir(parent_sequence_path)
+    # seq = parent_sequence_path
+
+    for seq in os.listdir(parent_sequence_path):
+        if seq not in ["0", "1", "2"]:
+            continue
+        dp_folder    = os.path.join(parent_sequence_path, seq, "dp")
+        gt_folder    = os.path.join(parent_sequence_path, seq, "depth")
+
+        dp_files = sorted(
+            (f for f in os.listdir(dp_folder) if f.endswith(".jpg")),
+            key=lambda x: int(os.path.splitext(x)[0])
+        )
+
+        gt_files = sorted(
+            (f for f in os.listdir(gt_folder) if f.endswith(".png")),
+            key=lambda x: int(os.path.splitext(x)[0])
+        )
+        max_idx = min(len(dp_files) - 2*frame_spacing, len(gt_files) - frame_spacing)
+
+        for i in range(max_idx):
+            # Load three input depth maps
+            imgs = []
+            for offset in (0, frame_spacing, 2*frame_spacing):
+                path = os.path.join(dp_folder, dp_files[i + offset])
+                img  = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.float32)  # OpenCV imread :contentReference[oaicite:2]{index=2}
+                img  = cv2.resize(img, target_size)
+                imgs.append(img)
+            all_inputs.append(tuple(imgs))
+
+            # Load GT for middle frame
+            gt_path = os.path.join(gt_folder, gt_files[i + frame_spacing])
+            gt_img   = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+            gt_img   = cv2.resize(gt_img, target_size) / 1000.0  # Normalize by 1000.0 to convert ground truth to meters
+            all_gts.append(gt_img)
+    return all_inputs, all_gts
+
+# ---------------------------
+# 2. Dataset Class
+# ---------------------------
+class CachedDepthDataset(Dataset):
+    """
+    Stores preprocessed depth triplets (d1, d2, d3) and corresponding GT.
+    Returns:
+      input_tensor: shape (3, H, W)
+      gt_tensor:    shape (1, H, W)
+    """
+    def __init__(self, inputs, gts):
+        self.inputs = inputs
+        self.gts    = gts
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        d1, d2, d3 = self.inputs[idx]
+        inp = np.stack([d1, d2, d3], axis=0).astype(np.float32)
+        gt  = self.gts[idx].astype(np.float32)[None, ...]
+        return torch.from_numpy(inp), torch.from_numpy(gt)
+
+# ---------------------------
+# 3. Model Definition
+# ---------------------------
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            # nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, padding_mode='reflect'),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            # nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, padding_mode='reflect'),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class UNet3In(nn.Module):
+    """
+    U‑Net that takes 3 input channels (e.g., three sequential depth maps)
+    and produces 1 output channel (the middle depth map prediction).
+    """
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 1,
+        features: list[int] = [64, 128, 256, 512]
+    ):
+        super().__init__()
+
+        # Encoder path
+        self.downs = nn.ModuleList()
+        prev_ch = in_channels
+        for feat in features:
+            self.downs.append(DoubleConv(prev_ch, feat))
+            prev_ch = feat
 
         # Bottleneck
-        self.bottleneck = UNet._block(features * 8, features * 16)
+        self.bottleneck = DoubleConv(prev_ch, prev_ch * 2)
+        prev_ch = prev_ch * 2  # now 512*2 = 1024 for features=[64,128,256,512]
 
-        # Decoder (upsampling path)
-        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
-        self.decoder4 = UNet._block(features * 16, features * 8)
-        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
-        self.decoder3 = UNet._block(features * 8, features * 4)
-        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
-        self.decoder2 = UNet._block(features * 4, features * 2)
-        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
-        self.decoder1 = UNet._block(features * 2, features)
+        # Decoder path: for each feature size in reverse, upsample then double‑conv
+        self.ups = nn.ModuleList()
+        for feat in reversed(features):
+            # 1) transpose conv to upsample from prev_ch → feat channels
+            self.ups.append(nn.ConvTranspose2d(prev_ch, feat, kernel_size=2, stride=2))
+            # 2) double conv on concatenated skip (feat) + upsampled (feat) = feat*2 → feat
+            self.ups.append(DoubleConv(feat * 2, feat))
+            prev_ch = feat  # update for next stage
 
-        # Final 1x1 convolution to get desired output channels
-        self.conv = nn.Conv2d(features, out_channels, kernel_size=1)
+        # Final 1×1 conv to map to the desired output channels
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
-    @staticmethod
-    def _block(in_channels, features):
-        """Creates a convolutional block with two Conv-BatchNorm-ReLU layers."""
-        return nn.Sequential(
-            nn.Conv2d(in_channels, features, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(features),
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        enc_feats: list[torch.Tensor] = []
+
+        # Encoder: store features then downsample
+        for down in self.downs:
+            x = down(x)
+            enc_feats.append(x)
+            x = F.max_pool2d(x, kernel_size=2)
+
+        # Bottleneck
+        x = self.bottleneck(x)
+
+        # Decoder: upsample, pad if needed, concat skip, then double‑conv
+        for idx in range(0, len(self.ups), 2):
+            upsample = self.ups[idx]
+            double_conv = self.ups[idx + 1]
+
+            x = upsample(x)
+            skip = enc_feats[-(idx // 2 + 1)]
+
+            # Pad to handle odd sizes
+            diffY = skip.size(2) - x.size(2)
+            diffX = skip.size(3) - x.size(3)
+            x = F.pad(x, [diffX // 2, diffX - diffX // 2,
+                          diffY // 2, diffY - diffY // 2])
+
+            # Concatenate along channel dimension
+            x = torch.cat([skip, x], dim=1)
+            x = double_conv(x)
+
+        # Final conv + ReLU clamp
+        x = self.final_conv(x)
+        # x = F.relu(x)  # ⟵ ensure outputs are ≥ 0
+        return x
+
+# ------ partialconv ------
+class PartialDoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            # First partial convolution + normalization + activation
+            PartialConv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(features),
-            nn.ReLU(inplace=True)
+            # Second partial convolution
+            PartialConv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
+        return self.net(x)
+
+class UNet3InPartial(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64,128,256,512]):
+        super().__init__()
         # Encoder
-        enc1 = self.encoder1(x)
-        enc2 = self.encoder2(self.pool1(enc1))
-        enc3 = self.encoder3(self.pool2(enc2))
-        enc4 = self.encoder4(self.pool3(enc3))
+        self.downs = nn.ModuleList()
+        prev_ch = in_channels
+        for feat in features:
+            self.downs.append(PartialDoubleConv(prev_ch, feat))
+            prev_ch = feat
+
         # Bottleneck
-        bottleneck = self.bottleneck(self.pool4(enc4))
-        # Decoder with skip connections
-        dec4 = self.upconv4(bottleneck)
-        dec4 = torch.cat((dec4, enc4), dim=1)
-        dec4 = self.decoder4(dec4)
+        self.bottleneck = PartialDoubleConv(prev_ch, prev_ch * 2)
+        prev_ch *= 2
 
-        dec3 = self.upconv3(dec4)
-        dec3 = torch.cat((dec3, enc3), dim=1)
-        dec3 = self.decoder3(dec3)
+        # Decoder
+        self.ups = nn.ModuleList()
+        for feat in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(prev_ch, feat, kernel_size=2, stride=2))
+            self.ups.append(PartialDoubleConv(feat * 2, feat))
+            prev_ch = feat
 
-        dec2 = self.upconv2(dec3)
-        dec2 = torch.cat((dec2, enc2), dim=1)
-        dec2 = self.decoder2(dec2)
+        self.final = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
-        dec1 = self.upconv1(dec2)
-        dec1 = torch.cat((dec1, enc1), dim=1)
-        dec1 = self.decoder1(dec1)
-        return self.conv(dec1)
+    def forward(self, x):
+        skips = []
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+            x = nn.functional.max_pool2d(x, 2)
 
-# -------------------------
-# Define the masked L1 loss
-# -------------------------
-def masked_l1_loss(pred, target, mask_value=0.0, epsilon=1e-6):
+        x = self.bottleneck(x)
+
+        for i in range(0, len(self.ups), 2):
+            x = self.ups[i](x)
+            skip = skips[-(i//2 + 1)]
+            # Pad if needed (should rarely artifact thanks to partial convs)
+            dy, dx = skip.size(2) - x.size(2), skip.size(3) - x.size(3)
+            x = nn.functional.pad(x, [dx//2, dx-dx//2, dy//2, dy-dy//2])
+            x = torch.cat([skip, x], dim=1)
+            x = self.ups[i+1](x)
+
+        return self.final(x)
+
+# ---------------------------
+# 4. Loss Function
+# ---------------------------
+def indexed_masked_mse_loss(pred, target):
+    mask = target != 0.0
+    pred_vals   = pred[mask]
+    target_vals = target[mask]
+    if pred_vals.numel() == 0:
+        return torch.tensor(0., device=pred.device, requires_grad=True)
+    return F.mse_loss(pred_vals, target_vals)
+
+# ---------------------------
+# 5. Data Visualization
+# ---------------------------
+def visualize_prediction(input_seq: torch.Tensor,
+                                  gt: torch.Tensor,
+                                  pred: torch.Tensor):
     """
-    Compute L1 loss while ignoring pixels where the ground truth equals mask_value.
-    This prevents the network from learning zeros that represent missing data.
+    Displays three input frames, the ground truth, and the prediction
+    in two rows:
+      - Row 1: shared scale (vmin=0, vmax=1)
+      - Row 2: individual auto scales
     """
-    mask = (target != mask_value).float()
-    valid_pixels = mask.sum()
-    if valid_pixels < epsilon:
-        return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-    loss = F.l1_loss(pred * mask, target * mask, reduction='sum') / valid_pixels
-    return loss
+    # Convert to NumPy
+    seq_np  = input_seq.cpu().numpy()
+    gt_np   = gt.detach().cpu().numpy().squeeze(0)
+    pred_np = pred.detach().cpu().numpy().squeeze(0)
 
-# -------------------------
-# Define the dataset loader
-# -------------------------
-class DepthDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        """
-        Expects a root_dir containing multiple dataset folders (e.g., rgbd_dataset_freiburg1_desk).
-        Each dataset folder should contain two folders:
-          - 'dp': folder with Depth Pro (input) depth maps.
-          - 'depth': folder with ground truth depth maps.
-        This loader creates samples by taking three consecutive images from 'dp' (using the middle image as the reference)
-        and matching it by index with the corresponding ground truth image from 'depth'.
-        """
-        self.samples = []
-        self.transform = transform if transform is not None else transforms.ToTensor()
-        # Iterate over each dataset folder
-        dataset_folders = [os.path.join(root_dir, d) for d in os.listdir(root_dir)
-                           if os.path.isdir(os.path.join(root_dir, d))]
-        print("Found dataset folders:", dataset_folders)
-        for ds in dataset_folders:
-            dp_folder = os.path.join(ds, "dp")
-            gt_folder = os.path.join(ds, "depth")
-            if not os.path.exists(dp_folder) or not os.path.exists(gt_folder):
-                continue
-            dp_files = glob.glob(os.path.join(dp_folder, "*"))
-            gt_files = glob.glob(os.path.join(gt_folder, "*"))
-            n = min(len(dp_files), len(gt_files))
-            # Ensure there are at least 3 images in the smaller folder for a valid sample
-            if n < 3:
-                continue
-            # Use index matching to form samples.
-            # Input: three consecutive dp images; GT: corresponding ground truth for the middle frame.
-            # Also, return the file name from the middle dp image.
-            for i in range(1, n - 1):
-                file_name = os.path.basename(dp_files[i])
-                self.samples.append((dp_files[i-1], dp_files[i], dp_files[i+1], gt_files[i], file_name))
-        print("Number of samples found:", len(self.samples))
+    fig, axes = plt.subplots(2, 5, figsize=(18, 7))  # 2 rows, 5 cols :contentReference[oaicite:0]{index=0}
 
-    def __len__(self):
-        return len(self.samples)
+    # --- Row 1: fixed scale ---
+    for i in range(3):
+        im = axes[0, i].imshow(seq_np[i], cmap='plasma', vmin=0, vmax=1)
+        axes[0, i].set_title(f'Input t{["-1","0","+1"][i]} (fixed)')
+        axes[0, i].axis('off')
+        fig.colorbar(im, ax=axes[0, i], fraction=0.046, pad=0.04)  # per‑panel colorbar :contentReference[oaicite:1]{index=1}
 
-    def __getitem__(self, idx):
-        dp1_path, dp2_path, dp3_path, gt_path, file_name = self.samples[idx]
-        # Open images and convert them to grayscale
-        dp1 = Image.open(dp1_path).convert('L')
-        dp2 = Image.open(dp2_path).convert('L')
-        dp3 = Image.open(dp3_path).convert('L')
-        gt = Image.open(gt_path).convert('L')
-        # Apply transformation (e.g., conversion to a tensor)
-        dp1 = self.transform(dp1)
-        dp2 = self.transform(dp2)
-        dp3 = self.transform(dp3)
-        gt = self.transform(gt)
-        # Concatenate the three dp images along the channel dimension: shape [3, H, W]
-        input_tensor = torch.cat([dp1, dp2, dp3], dim=0)
-        return input_tensor, gt, file_name
+    im_gt = axes[0, 3].imshow(gt_np,   cmap='plasma', vmin=0, vmax=1)
+    axes[0, 3].set_title('Ground Truth (fixed)')
+    axes[0, 3].axis('off')
+    fig.colorbar(im_gt, ax=axes[0, 3], fraction=0.046, pad=0.04)
 
-# -------------------------
-# Function to plot input, ground truth, and output
-# -------------------------
-def plot_sample(input_tensor, gt, output, file_name="Unknown"):
-    """
-    Plot the three input depth maps, the ground truth, and the network output,
-    including the file name in the plot.
-    
-    Args:
-        input_tensor (Tensor): A tensor of shape [3, H, W] containing the three input depth maps.
-        gt (Tensor): A tensor of shape [1, H, W] for the ground truth depth.
-        output (Tensor): A tensor of shape [1, H, W] for the network predicted depth.
-        file_name (str): The file name associated with this sample.
-    """
-    # Convert tensors to numpy arrays and squeeze extra dimensions.
-    dp1 = input_tensor[0].cpu().numpy().squeeze()
-    dp2 = input_tensor[1].cpu().numpy().squeeze()
-    dp3 = input_tensor[2].cpu().numpy().squeeze()
-    gt_np = gt.cpu().numpy().squeeze()
-    output_np = output.cpu().detach().numpy().squeeze()
-    
-    # Create a figure with 5 subplots.
-    fig, axs = plt.subplots(1, 5, figsize=(20, 5))
-    axs[0].imshow(dp1, cmap="gray")
-    axs[0].set_title("Input dp1")
-    axs[1].imshow(dp2, cmap="gray")
-    axs[1].set_title("Input dp2")
-    axs[2].imshow(dp3, cmap="gray")
-    axs[2].set_title("Input dp3")
-    axs[3].imshow(gt_np, cmap="gray")
-    axs[3].set_title("Ground Truth")
-    axs[4].imshow(output_np, cmap="gray")
-    axs[4].set_title("Output")
-    for ax in axs:
+    im_pr = axes[0, 4].imshow(pred_np, cmap='plasma', vmin=0, vmax=1)
+    axes[0, 4].set_title('Prediction (fixed)')
+    axes[0, 4].axis('off')
+    fig.colorbar(im_pr, ax=axes[0, 4], fraction=0.046, pad=0.04)
+
+    # --- Row 2: auto scale per image ---
+    items = list(seq_np) + [gt_np, pred_np]
+    titles = [f'Input t{t} (auto)' for t in ["-1","0","+1"]] + ['Ground Truth (auto)', 'Prediction (auto)']
+    for j, (img, title) in enumerate(zip(items, titles)):
+        ax = axes[1, j]
+        im = ax.imshow(img, cmap='plasma')  # no vmin/vmax → auto-scale :contentReference[oaicite:2]{index=2}
+        ax.set_title(title)
         ax.axis('off')
-        
-    # Include the file name as a super title for the plot.
-        
-    print("File Name:", file_name)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    fig.suptitle(f"File: {file_name}", fontsize=16)
+    print(f"Shapes of all images: {[img.shape for img in items]}")
+
     plt.tight_layout()
     plt.show()
 
-# -------------------------
-# Main training/demo loop
-# -------------------------
-if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Path where your datasets are stored
-    dataset_path = "/home/jordanprescott/shiv_research/tnt_data"
-    dataset = DepthDataset(dataset_path)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-    
-    # Initialize the model
-    model = UNet(in_channels=3, out_channels=1).to(device)
-    
-    # Process one batch for demonstration
-    for inputs, gt, file_names in dataloader:
-        inputs = inputs.to(device)
-        gt = gt.to(device)
-        outputs = model(inputs)
-        loss = masked_l1_loss(outputs, gt)
-        print("Batch Loss:", loss.item())
-        
-        # Plot the first sample from the batch, including the file name in the title.
-        plot_sample(inputs[0], gt[0], outputs[0], file_name=file_names[0])
-        break
+def create_sequence_gif(model, dataloader, device, gif_path='predictions.gif', fps=2):
+    """
+    Runs the model on each batch of depth‑sequence samples and
+    saves an animated GIF of the inputs, ground truth, and predictions.
+
+    Args:
+      model       : your UNet3In instance (in eval mode)
+      dataloader  : torch DataLoader yielding (seqs, gts)
+      device      : 'cuda' or 'cpu'
+      gif_path    : output file path for the GIF
+      fps         : frames per second for the GIF
+    """
+    model.eval()
+    frames = []
+
+    with torch.no_grad():
+        for seqs, gts in dataloader:
+            seqs, gts = seqs.to(device), gts.to(device)            # send to device
+            preds = model(seqs)                                    # get predictions
+
+            # Loop over batch
+            for i in range(seqs.size(0)):
+                fig, axes = plt.subplots(1, 5, figsize=(15, 3))
+                # Plot inputs t-1, t0, t+1
+                for j in range(3):
+                    axes[j].imshow(seqs[i, j].cpu().numpy(), cmap='magma')
+                    axes[j].set_title(f'Input t{["-1","0","+1"][j]}')
+                    axes[j].axis('off')
+                # Ground truth
+                axes[3].imshow(gts[i,0].cpu().numpy(), cmap='magma')
+                axes[3].set_title('Ground Truth')
+                axes[3].axis('off')
+                # Prediction
+                axes[4].imshow(preds[i,0].cpu().numpy(), cmap='magma')
+                axes[4].set_title('Prediction')
+                axes[4].axis('off')
+
+                # Draw the canvas, extract as RGBA buffer
+                fig.canvas.draw()
+                image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+                w, h = fig.canvas.get_width_height()
+                image = image.reshape((h, w, 3))
+
+                frames.append(image)                                   # collect frame
+                plt.close(fig)
+
+    # Write out GIF
+    imageio.mimsave(gif_path, frames, fps=fps)                       # write GIF :contentReference[oaicite:1]{index=1}
+    print(f"Saved GIF to {gif_path}")
+
+# ---------------------------
+# 6. Main: Data & Training
+# ---------------------------
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(base_dir, "saved_data_8")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    inp_cache = os.path.join(cache_dir, "depth_input_seq.npy")
+    gt_cache  = os.path.join(cache_dir, "depth_gt_seq.npy")
+
+    if os.path.exists(inp_cache) and os.path.exists(gt_cache):
+        print("Loading cached data...")
+        inputs = np.load(inp_cache, allow_pickle=True)
+        gts    = np.load(gt_cache, allow_pickle=True)
+    else:
+        print("Preprocessing data...")
+        inputs, gts = preprocess_depth_sequence(
+            os.path.join(base_dir, "tnt_data/"),
+            frame_spacing=10, target_size=(128,128)
+        )
+        # inputs, gts = preprocess_depth_sequence_scenenet(
+        #     os.path.join(base_dir, "tnt_data/rgbd_scenenet/train/0"),
+        #     frame_spacing=3, target_size=(128,128)
+        # )
+        np.save(inp_cache, np.array(inputs, dtype=object))
+        np.save(gt_cache,  np.array(gts,    dtype=object))
+
+    dataset  = CachedDepthDataset(inputs, gts)
+    total    = len(dataset)
+    train_n  = int(0.7 * total)
+    val_n    = int(0.15 * total)
+    test_n   = total - train_n - val_n
+
+    # train_ds, val_ds, test_ds = random_split(
+    #     dataset, [train_n, val_n, test_n], generator=torch.Generator().manual_seed(42)
+    # )
+    # train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)  # PyTorch DataLoader :contentReference[oaicite:3]{index=3}
+    # val_loader   = DataLoader(val_ds,   batch_size=16, shuffle=False)
+    # test_loader  = DataLoader(test_ds,  batch_size=16, shuffle=False)
+
+    # 1. Split sequentially
+    train_indices = range(0,   train_n)
+    val_indices   = range(train_n,   train_n + val_n)
+    test_indices  = range(train_n + val_n, total)
+
+    train_ds = Subset(dataset, train_indices)
+    val_ds   = Subset(dataset, val_indices)
+    test_ds  = Subset(dataset, test_indices)
+
+    # 2. Create loaders
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=16, shuffle=True)
+    test_loader  = DataLoader(test_ds,  batch_size=16, shuffle=True)
+
+    # 3. For GIF visualization (one frame at a time, in order)
+    viz_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
+
+    model     = UNet3In(in_channels=3, out_channels=1).to(device)
+    # model     = UNet3InPartial(in_channels=3, out_channels=1).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    if os.path.exists(os.path.join(cache_dir, "unet3in_depth.pth")):
+        print("Loading cached model...")
+        model.load_state_dict(torch.load(os.path.join(cache_dir, "unet3in_depth.pth")))
+    else:
+        print("Training model...")
+        for epoch in range(1, 1 + 10):
+            model.train()
+            epoch_loss = 0.0
+            for seqs, targets in train_loader:
+                seqs, targets = seqs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                preds = model(seqs)
+                loss  = indexed_masked_mse_loss(preds, targets)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            print(f"Epoch {epoch:02d} — Train Loss: {epoch_loss/len(train_loader):.4f}")
+        model_save_path = os.path.join(cache_dir, "unet3in_depth.pth")
+        torch.save(model.state_dict(), model_save_path)
+
+
+    # Get one batch
+    seqs, gts = next(iter(test_loader))     # get first batch from your DataLoader
+    # Move data & model to device
+    seqs = seqs.to(device)
+    gts  = gts.to(device)
+    # Compute predictions
+    with torch.no_grad():
+        preds = model(seqs)
+    # Visualize the first sample in the batch:
+    visualize_prediction(
+        input_seq=seqs[0],
+        gt=       gts[0],
+        pred=     preds[0]
+    )
+
+    create_sequence_gif(model, viz_loader, device, gif_path='saved_data_8/vis.gif', fps=8)

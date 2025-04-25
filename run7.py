@@ -48,7 +48,11 @@ class UNet(nn.Module):
             self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2))
             self.up_convs.append(DoubleConv(feature*2, feature))
         
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(features[0], out_channels, kernel_size=1),
+            nn.ReLU()
+        )
+
     
     def forward(self, x):
         skip_connections = []
@@ -135,12 +139,16 @@ class CachedDepthDataset(Dataset):
 # ---------------------------
 def masked_mse_loss(pred, gt, mask_value=0.0):
     """
-    Computes the Mean Squared Error only over the pixels where gt != mask_value.
+    Computes MSE over pixels where gt != mask_value, using indexing to avoid propagating gradients
+    through masked-out values.
     """
-    mask = (gt != mask_value).float()  # valid pixels are marked as 1, invalid as 0
-    diff = (pred - gt) ** 2
-    loss = (diff * mask).sum() / (mask.sum() + 1e-6)
-    return loss
+    valid_mask = gt != mask_value
+    pred_valid = pred[valid_mask]
+    gt_valid = gt[valid_mask]
+    if pred_valid.numel() == 0:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)  # Avoid division by zero
+    return F.mse_loss(pred_valid, gt_valid)
+
 
 # ---------------------------
 # Postprocessing Functions
@@ -345,9 +353,9 @@ if __name__ == "__main__":
 
     model = UNet(in_channels=3, out_channels=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
+    # loss_fn = nn.MSELoss()
 
-    # loss_fn = masked_mse_loss
+    loss_fn = masked_mse_loss
 
 
     checkpoint_path = os.path.join(save_folder, "unet_depth_model.pth")
@@ -358,7 +366,7 @@ if __name__ == "__main__":
         skip_training = True
 
     if not skip_training:
-        num_epochs = 30
+        num_epochs = 5
         patience = 10
         epochs_without_improvement = 0
         best_val_loss = float('inf')

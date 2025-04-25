@@ -44,15 +44,11 @@ for image_path in image_paths:
     # Infer the depth map (H x W numpy array)
     depth = model.infer_image(raw_img)
 
-    # Option 1: Save as a normalized grayscale image (8-bit)
-    depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
-    depth_uint8 = depth_normalized.astype("uint8")
-
     # Construct the output file path (using the same filename)
     filename = os.path.basename(image_path)
     output_path = os.path.join(output_dir, filename)
     
     # Save the depth map as an image
-    cv2.imwrite(output_path, depth_uint8)
+    cv2.imwrite(output_path, depth)
     
     print(f"Processed {image_path} and saved depth map to {output_path}")
